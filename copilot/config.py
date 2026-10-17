@@ -68,7 +68,7 @@ class Settings:
     llm_timeout_s: float = 90.0
     # Request pacing / retries for the hosted model API
     llm_min_interval_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MIN_INTERVAL_S", 1.5))
-    llm_max_retries: int = field(default_factory=lambda: int(_env_float("COPILOT_LLM_MAX_RETRIES", 3)))
+    llm_max_retries: int = field(default_factory=lambda: int(_env_float("COPILOT_LLM_MAX_RETRIES", 4)))
     llm_max_retry_wait_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MAX_RETRY_WAIT_S", 75.0))
     llm_max_total_wait_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MAX_TOTAL_WAIT_S", 150.0))
 

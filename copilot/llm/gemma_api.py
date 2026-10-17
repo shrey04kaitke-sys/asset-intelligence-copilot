@@ -14,7 +14,7 @@ import time
 from typing import Any, Literal
 
 from .base import RETRYABLE, LLMError, LLMResponse, ToolCall, Turn, Usage, scrub
-from .pacing import Pacer, classify_429, retry_after_seconds
+from .pacing import Pacer, classify_429, quota_ids, retry_after_seconds
 from ..config import Settings
 from ..credentials import CredentialStoreError
 
@@ -29,34 +29,45 @@ _SCHEMA_KEYS = {"type", "description", "enum", "format", "items", "properties", 
                 "minLength", "maxLength", "pattern"}
 
 
-def to_gemini_schema(node: Any) -> dict:
-    """Convert a pydantic JSON schema (refs already inlined) into the subset the Gemini API accepts."""
+_SLIM_DROP = {"nullable", "format", "pattern", "minimum", "maximum", "minItems", "maxItems", "minLength", "maxLength"}
+_SHARED_OBJECTS = {"scope", "window"}          # described once in the system prompt instead of in every tool
+
+
+def to_gemini_schema(node: Any, slim: bool = False, _depth: int = 0, _key: str = "") -> dict:
+    """Convert a pydantic JSON schema (refs already inlined) into the subset the Gemini API accepts.
+
+    slim=True sends only what the model needs to build a call (types, enums, required, top-level parameter descriptions):
+    bounds, patterns, formats, nullable flags and nested prose are dropped because the registry validates every call
+    strictly anyway. This cuts the per-request declaration payload by more than half.
+    """
     if isinstance(node, dict):
         any_of = node.get("anyOf")
         if any_of:
             non_null = [n for n in any_of if n.get("type") != "null"]
             nullable = len(non_null) != len(any_of)
             if len(non_null) == 1:
-                out = to_gemini_schema(non_null[0])
-                if nullable:
+                out = to_gemini_schema(non_null[0], slim, _depth, _key)
+                if nullable and not slim:
                     out["nullable"] = True
-                if "description" in node and "description" not in out:
+                if "description" in node and "description" not in out and not (slim and (_depth >= 2 or _key in _SHARED_OBJECTS)):
                     out["description"] = node["description"]
                 return out
-            out = {"anyOf": [to_gemini_schema(n) for n in non_null]}
-            if nullable:
+            out = {"anyOf": [to_gemini_schema(n, slim, _depth, _key) for n in non_null]}
+            if nullable and not slim:
                 out["nullable"] = True
-            if "description" in node:
+            if "description" in node and not (slim and (_depth >= 2 or _key in _SHARED_OBJECTS)):
                 out["description"] = node["description"]
             return out
         out: dict[str, Any] = {}
         for k, v in node.items():
-            if k not in _SCHEMA_KEYS:
+            if k not in _SCHEMA_KEYS or (slim and k in _SLIM_DROP):
+                continue
+            if k == "description" and slim and (_depth >= 2 or _key in _SHARED_OBJECTS):
                 continue
             if k == "properties":
-                out[k] = {pk: to_gemini_schema(pv) for pk, pv in v.items()}
+                out[k] = {pk: to_gemini_schema(pv, slim, _depth + 1, pk) for pk, pv in v.items()}
             elif k == "items":
-                out[k] = to_gemini_schema(v)
+                out[k] = to_gemini_schema(v, slim, _depth + 1, _key)
             elif k == "type" and isinstance(v, str):
                 out[k] = v.upper()
             else:
@@ -69,13 +80,14 @@ def to_gemini_schema(node: Any) -> dict:
 
 class GemmaApiProvider:
     name = "gemma_api"
-    BASE_BACKOFF_S = 1.5
+    BASE_BACKOFF_S = 2.0
     MAX_BACKOFF_S = 30.0
 
     def __init__(self, settings: Settings | None = None, *, model: str | None = None, client: Any = None, timeout_s: float | None = None,
                  max_retries: int | None = None, sleep=time.sleep, pacer: Pacer | None = None, rng: random.Random | None = None,
-                 max_retry_wait_s: float | None = None, max_total_wait_s: float | None = None):
+                 max_retry_wait_s: float | None = None, max_total_wait_s: float | None = None, slim_schemas: bool = True):
         self.settings = settings or Settings()
+        self.slim_schemas = slim_schemas
         self.model = (model or self.settings.model or "").strip()
         if not self.model.lower().startswith("gemma-"):
             raise LLMError("invalid_request", f"model id '{scrub(self.model, limit=60)}' is not a Gemma model (expected e.g. gemma-4-26b-a4b-it); refusing to run a different model",
@@ -121,7 +133,7 @@ class GemmaApiProvider:
             cfg["system_instruction"] = system
         if tools:
             cfg["tools"] = [types.Tool(function_declarations=[
-                types.FunctionDeclaration(name=t["name"], description=t["description"], parameters=types.Schema.model_validate(to_gemini_schema(t["parameters"])))
+                types.FunctionDeclaration(name=t["name"], description=t["description"], parameters=types.Schema.model_validate(to_gemini_schema(t["parameters"], slim=self.slim_schemas)))
                 for t in tools])]
             if tool_mode != "auto":
                 cfg["tool_config"] = types.ToolConfig(function_calling_config=types.FunctionCallingConfig(
@@ -243,7 +255,8 @@ class GemmaApiProvider:
             if code == 429:
                 if classify_429(e) == "daily":
                     return LLMError("quota", f"the daily quota or billing limit is exhausted; waiting will not help ({detail})", status_code=code, **kw)
-                return LLMError("rate_limit", f"the request rate or token rate limit was hit ({detail})", status_code=code, **kw)
+                ids = quota_ids(e)
+                return LLMError("rate_limit", f"the request rate or token rate limit was hit ({detail})" + (f" [limit: {', '.join(ids[:3])}]" if ids else ""), status_code=code, **kw)
             if code == 400:
                 return LLMError("invalid_request", f"the provider rejected the request ({detail})", status_code=code, **kw)
             if code and code >= 500:

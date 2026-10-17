@@ -135,6 +135,7 @@ class OrchestratorConfig:
     escalate_on_truncation: bool = True
     pending_ttl_s: int = 900
     max_answer_chars: int = 8000
+    visual_via_tool: bool = False       # False: the model ends its answer with '[visual: table]'; True: it calls choose_visual (one more model call)
 
 
 # ================================================================================ small deterministic helpers
@@ -147,6 +148,7 @@ _NON_DECLARATIVE_START = re.compile(r"^(show|list|give|tell|what|which|who|whom|
                                     r"please|display|plot|draw|compare|find|get|count|summari[sz]e|explain|has|have|had)\b", re.I)
 _MODEL_SLIPS = frozenset({"unknown_tool", "invalid_arguments", "invalid_window", "window_too_wide", "unknown_equipment_kind", "unknown_area", "unknown_well_type"})
 CONFLICT_RE = re.compile(r"disagree|competing|conflict|contradict|out of date|stale|differs|unconfirmed|not match|recorded_status says|inspections are the truth", re.I)
+VISUAL_MARK = re.compile(r"\s*\[\s*visual\s*:\s*([A-Za-z]+)\s*\]\s*$", re.I)
 _ID = re.compile(r"\b[A-Za-z]{1,5}-[A-Za-z0-9-]*\d[A-Za-z0-9-]*\b|\bT\d{3}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _NUM = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?")
@@ -206,6 +208,7 @@ class _Run:
     calls: dict[str, _Call] = field(default_factory=dict)
     pool: dict[str, EvidenceItem] = field(default_factory=dict)
     chosen: tuple[str, str] | None = None
+    chosen_type: str | None = None        # visual named by the model in its answer's trailing [visual: x] marker
     seq: int = 0
     executed: int = 0
     malformed_retries: int = 0
@@ -273,8 +276,8 @@ class Orchestrator:
                           require_grounding=True, allow_writes=writes_ok)
         system = build_system_prompt(user=user, as_of=self.domain.as_of, as_of_basis=self.domain.as_of_basis,
                                      areas=[a["name"] for a in self.domain.areas().values()], well_types=self.domain.well_types(),
-                                     requested_visual=requested, writes_allowed=writes_ok)
-        specs = self.registry.function_specs(include_mutating=writes_ok) + [CHOOSE_VISUAL]
+                                     requested_visual=requested, writes_allowed=writes_ok, visual_via_tool=self.cfg.visual_via_tool)
+        specs = self.registry.function_specs(include_mutating=writes_ok) + ([CHOOSE_VISUAL] if self.cfg.visual_via_tool else [])
         turns = self._history(run.conversation_id, req.user_id) + [Turn("user", text=req.question)]
         thinking = req.thinking or self.cfg.thinking
         try:
@@ -417,6 +420,10 @@ class Orchestrator:
     def _finalize(self, run: _Run, user: dict, text: str, requested: str | None, thinking) -> AskResponse:
         req = run.req
         text = (text or "").strip()[: self.cfg.max_answer_chars]
+        mark = VISUAL_MARK.search(text)
+        if mark:                                                         # the visual marker is control syntax, not part of the answer
+            run.chosen_type = mark.group(1).lower()
+            text = text[: mark.start()].rstrip()
         warnings: list[str] = list(run.notes)
         cited = list(dict.fromkeys(REF.findall(text)))
         valid = [r for r in cited if r in run.pool]
@@ -469,8 +476,15 @@ class Orchestrator:
             if not cands:
                 return None, (f"no data was available to draw a {requested}" if requested else None), None
             src = cands[-1]
+            suggested = requested or run.chosen_type
+            if suggested and not requested:                              # the model's own suggestion: use the latest result that can draw it
+                match = [c for c in cands if suggested in c.env.visuals]
+                if match:
+                    src = match[-1]
             env = src.env
-            spec, note = select_visual(env, requested)
+            spec, note = select_visual(env, suggested)
+            if note and not requested:
+                note = f"the model suggested a {suggested}, which this result cannot draw; showing a {env.default_visual} instead (available: {', '.join(env.visuals)})"
         if spec is None:
             return None, note, None
         return spec, note, {"tool": src.name, "call_id": src.call_id, "type": spec.get("type")}

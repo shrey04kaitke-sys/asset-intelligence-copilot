@@ -272,7 +272,7 @@ def test_error_mapping_and_retry_policy(err, kind, retried):
 def test_transient_failure_then_success_is_retried_with_backoff():
     p = prov([api_error(503, "overloaded", "UNAVAILABLE"), api_error(500, "oops", "INTERNAL"), resp([{"text": "ok"}])], max_retries=2)
     r = p.generate(U)
-    assert r.text == "ok" and r.attempts == 3 and p.sleeps == [1.5, 3.0]
+    assert r.text == "ok" and r.attempts == 3 and p.sleeps == [2.0, 4.0]
     assert [c["model"] for c in p._client.models.calls] == ["gemma-4-26b-a4b-it"] * 3
 
 
@@ -376,3 +376,40 @@ def test_require_text_is_not_satisfied_by_tool_calls_alone():
     assert not r.empty
     with pytest.raises(LLMError):
         r.require_text()                                             # a tool call is not answer text; callers must handle it first
+
+
+# ---------------------------------------------------------------------------------------- slim declarations (offline)
+def test_slim_declarations_are_much_smaller_but_keep_types_enums_and_required():
+    reg = build_registry()
+    specs = reg.function_specs(include_mutating=False)
+    full = sum(len(json.dumps(to_gemini_schema(s["parameters"]))) for s in specs)
+    slim = sum(len(json.dumps(to_gemini_schema(s["parameters"], slim=True))) for s in specs)
+    assert slim < 0.6 * full and slim < 14000
+    dt = next(s for s in specs if s["name"] == "get_downtime")
+    out = to_gemini_schema(dt["parameters"], slim=True)
+    win = out["properties"]["window"]
+    assert win["properties"]["unit"]["enum"] == ["days", "weeks", "months", "years"] and win["properties"]["last_n"] == {"type": "INTEGER"}
+    assert "description" not in win and "description" not in out["properties"]["scope"] and "nullable" not in json.dumps(out)
+    assert all(k not in json.dumps(out) for k in ("maxLength", "minimum", "maximum", "pattern", "format"))
+    assert out["properties"]["top_n"]["type"] == "INTEGER"                              # tool-specific parameters keep their type
+    status = next(s for s in specs if s["name"] == "get_asset_status")
+    st = to_gemini_schema(status["parameters"], slim=True)
+    assert st["required"] == ["asset_id"] and st["properties"]["asset_id"]["description"]   # top-level parameter descriptions are kept
+    spill = next(s for s in specs if s["name"] == "get_spill_compliance")
+    assert to_gemini_schema(spill["parameters"], slim=True)["properties"]["protocol"]["enum"] == ["any", "SR-01", "SR-02", "SR-03"]
+
+
+def test_slim_declarations_still_validate_as_sdk_schemas_and_are_what_the_provider_sends():
+    reg = build_registry()
+    for s in reg.function_specs():
+        types.FunctionDeclaration(name=s["name"], description=s["description"], parameters=types.Schema.model_validate(to_gemini_schema(s["parameters"], slim=True)))
+    p = prov([resp([{"text": "ok"}])])
+    p.generate(U, tools=reg.function_specs(include_mutating=False))
+    sent = p._client.models.calls[0]["config"].tools[0].function_declarations
+    dt = next(d for d in sent if d.name == "get_downtime")
+    assert dt.parameters.properties["window"].properties["last_n"].minimum is None and dt.parameters.properties["window"].description is None
+    assert GemmaApiProvider(Settings(), client=FakeClient([])).slim_schemas is True
+    p2 = GemmaApiProvider(Settings(), client=FakeClient([resp([{"text": "ok"}])]), slim_schemas=False)
+    p2.generate(U, tools=reg.function_specs(include_mutating=False))
+    full = next(d for d in p2._client.models.calls[0]["config"].tools[0].function_declarations if d.name == "get_downtime")
+    assert full.parameters.properties["window"].properties["last_n"].minimum == 1

@@ -148,7 +148,7 @@ def test_exponential_backoff_with_jitter_is_bounded():
     p = provider([api_error(503, "x", "UNAVAILABLE")] * 7, max_retries=6, rng=random.Random(42), max_retry_wait_s=100, max_total_wait_s=1000)
     with pytest.raises(LLMError):
         p.generate(U)
-    bases = [1.5, 3.0, 6.0, 12.0, 24.0, 30.0]                                                                  # doubles, then capped at 30
+    bases = [2.0, 4.0, 8.0, 16.0, 30.0, 30.0]                                                                  # doubles, then capped at 30
     delays = [s for s in p.clock.sleeps]
     assert len(delays) == 6
     for d, b in zip(delays, bases):
@@ -159,7 +159,7 @@ def test_exponential_backoff_with_jitter_is_bounded():
 def test_server_error_then_success_uses_backoff_and_reports_attempts():
     p = provider([api_error(500, "boom", "INTERNAL"), api_error(503, "busy", "UNAVAILABLE"), OK])
     r = p.generate(U)
-    assert r.attempts == 3 and p.clock.sleeps == [1.5, 3.0]
+    assert r.attempts == 3 and p.clock.sleeps == [2.0, 4.0]
 
 
 # ----------------------------------------------------------------------------- pacer
@@ -244,5 +244,16 @@ def test_pacing_settings_come_from_the_environment(monkeypatch):
     assert (s.llm_min_interval_s, s.llm_max_retries, s.llm_max_retry_wait_s) == (4.5, 5, 20.0)
     p = GemmaApiProvider(Settings(), client=FakeClient([]))
     assert p.max_retries == 5 and p.max_retry_wait_s == 20 and p.pacer.base_interval == 4.5
+    monkeypatch.delenv("COPILOT_LLM_MAX_RETRIES")
+    assert Settings().llm_max_retries == 4                                                                      # default: 5 attempts in total
     monkeypatch.setenv("COPILOT_LLM_MIN_INTERVAL_S", "banana")
     assert Settings().llm_min_interval_s == 1.5                                                                # bad values fall back to defaults
+
+
+def test_rate_limit_message_names_the_quota_that_was_hit():
+    body = {"error": {"code": 429, "message": "You exceeded your current quota", "status": "RESOURCE_EXHAUSTED", "details": [
+        {"@type": "type.googleapis.com/google.rpc.QuotaFailure", "violations": [{"quotaId": "GenerateContentInputTokensPerModelPerMinute-FreeTier", "quotaMetric": "x"}]}]}}
+    p = provider([errors.ClientError(429, body)] * 4, max_retries=0)
+    with pytest.raises(LLMError) as ei:
+        p.generate(U)
+    assert "GenerateContentInputTokensPerModelPerMinute-FreeTier" in ei.value.message and ei.value.kind == "rate_limit"

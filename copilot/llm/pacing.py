@@ -109,3 +109,16 @@ def classify_429(err: Any) -> str:
     if any(w in blob for w in ("perminute", "per minute", "per_minute", "rate limit", "too many requests")):
         return "per_minute"
     return "unknown"
+
+
+def quota_ids(err: Any) -> list[str]:
+    """Names of the quotas the API says were exceeded (e.g. '...InputTokensPerModelPerMinute-FreeTier'). Safe to show."""
+    details = getattr(err, "details", None)
+    items = (details.get("error", {}) or {}).get("details", []) if isinstance(details, dict) else []
+    out: list[str] = []
+    for d in items if isinstance(items, list) else []:
+        if isinstance(d, dict):
+            for v in d.get("violations", []) or []:
+                if isinstance(v, dict) and v.get("quotaId") and str(v["quotaId"]) not in out:
+                    out.append(str(v["quotaId"])[:120])
+    return out

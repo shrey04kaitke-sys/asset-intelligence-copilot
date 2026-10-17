@@ -115,7 +115,8 @@ def test_system_prompt_and_tool_offer_depend_on_the_message(dom, fb, state, regi
     o, prov = make(dom, fb, state, registry, [mk(text="ok"), mk(text="ok")])
     ask(o, "Is WELL-0001 producing oil right now?")
     names = {t["name"] for t in prov.calls[0]["tools"]}
-    assert "choose_visual" in names and "get_asset_status" in names and not {n for n in names if n.startswith("record_")}
+    assert "choose_visual" not in names and "get_asset_status" in names and not {n for n in names if n.startswith("record_")}
+    assert "[visual: <type>]" in prov.calls[0]["system"]                       # default: the model names the visual at the end of its answer
     assert "Michael Turner" in prov.calls[0]["system"] and "2026-10-16" in prov.calls[0]["system"] and "production supervisor" in prov.calls[0]["system"]
     assert "record_* tools are unavailable" in prov.calls[0]["system"]
     ask(o, "WELL-0175 is running fine")
@@ -433,3 +434,56 @@ def test_response_is_always_json_serialisable_and_has_no_internals(dom, fb, stat
     blob = json.dumps(ask(o).model_dump(), default=str)
     for leak in ("thought_signature", "thought_chars", "chain of thought", "Traceback", "sqlite", "C:\\\\", "AIza"):
         assert leak not in blob
+
+
+def test_system_prompt_documents_the_shared_argument_conventions(dom, fb, state, registry):
+    """The slim tool declarations omit per-field prose for scope/window; the prompt must carry it once."""
+    o, prov = make(dom, fb, state, registry, [mk(text="ok")])
+    ask(o)
+    s = prov.calls[0]["system"]
+    for needle in ("scope", "area", "well_type", "asset_ids", "window", "last_n", "unit", "calendar_year", "start_date", "end_date"):
+        assert needle in s
+
+
+# ============================================================================ visual marker mode (default) and the optional choose_visual tool mode
+def test_visual_marker_is_stripped_validated_and_used(dom, fb, state, registry):
+    o, prov = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(text="Three wells led downtime [inspection:INS-0121-0001].\n[visual: table]")])
+    r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
+    assert r.answer == "Three wells led downtime." or r.answer.startswith("Three wells led downtime")
+    assert "[visual" not in r.answer and r.visual["type"] == "table" and r.visual_note is None
+    assert len(prov.calls) == 2                                                  # no extra model call for the visual
+
+
+@pytest.mark.parametrize("marker,expected", [("[visual: BAR]", "bar"), ("[ visual : bar ]", "bar"), ("[visual:table]", "table")])
+def test_visual_marker_forms(dom, fb, state, registry, marker, expected):
+    o, _ = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(text=f"ok\n{marker}")])
+    r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
+    assert r.visual["type"] == expected and r.answer == "ok"
+
+
+def test_unavailable_or_nonsense_marker_falls_back_with_a_note(dom, fb, state, registry):
+    for bad in ("[visual: map]", "[visual: hologram]"):
+        o, _ = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(text=f"ok {bad}")])
+        r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
+        assert r.visual["type"] == "bar" and "cannot draw" in r.visual_note and r.answer == "ok"
+
+
+def test_user_named_visual_beats_the_marker_and_midtext_markers_are_left_alone(dom, fb, state, registry):
+    o, _ = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(text="ok\n[visual: bar]")])
+    assert ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months? Show a table.").visual["type"] == "table"
+    o, _ = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(text="Write [visual: bar] literally here, then more text.")])
+    r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
+    assert "[visual: bar]" in r.answer and r.visual["type"] == "bar"             # only a trailing marker is control syntax
+
+
+def test_marker_picks_the_latest_result_that_can_draw_it(dom, fb, state, registry):
+    o, _ = make(dom, fb, state, registry, [mk(calls=[STATUS, DOWNTIME]), mk(text="ok\n[visual: card]")])
+    r = ask(o, "Compare WELL-0001 and the downtime leaders in NE-7.")
+    assert r.visual["type"] == "card" and r.visual_source["tool"] == "get_asset_status"
+
+
+def test_choose_visual_tool_mode_is_still_available(dom, fb, state, registry):
+    o, prov = make(dom, fb, state, registry, [mk(calls=[DOWNTIME]), mk(calls=[("choose_visual", {"call_id": "c1", "visual_type": "table"})]), mk(text="ok")], visual_via_tool=True)
+    r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
+    assert "choose_visual" in {t["name"] for t in prov.calls[0]["tools"]} and "call choose_visual" in prov.calls[0]["system"]
+    assert r.visual["type"] == "table" and len(prov.calls) == 3
