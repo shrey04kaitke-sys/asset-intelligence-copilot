@@ -123,6 +123,7 @@ class Tool:
     args_model: type[ArgsBase]
     handler: Callable[[ToolContext, Any], Out]
     mutating: bool = False
+    precheck: Callable[[ToolContext, Any], None] | None = None     # raises ToolError if the call would be refused (used by dry_run)
 
 
 class ToolRegistry:
@@ -205,6 +206,30 @@ class ToolRegistry:
                 return Out()
             started.set()
             return tool.handler(ctx, parsed)
+
+    def dry_run(self, name: Any, args: Any, ctx: ToolContext) -> tuple[ToolEnvelope | None, dict | None]:
+        """Validate a call without executing it. Returns (error_envelope, normalised_args); error is None when the call would be accepted.
+
+        Applies the same checks as `call` (known tool, argument schema, authentication, write limits) plus the tool's
+        `precheck` (e.g. that a write quotes the user's own message). Nothing is read from or written to the database.
+        """
+        tool = self._tools.get(name) if isinstance(name, str) else None
+        if tool is None:
+            return _error("<invalid>", "unknown_tool", f"no such tool; available tools: {', '.join(self.names)}"), None
+        try:
+            parsed = self._parse_args(tool, args)
+            if tool.mutating:
+                if not ctx.allow_writes:
+                    raise ToolError("writes_disabled", "this session cannot modify records")
+                if not ctx.user_id or ctx.user_id not in ctx.domain.users():
+                    raise ToolError("unauthenticated", "recording feedback requires a known signed-in user")
+                if ctx.writes >= MAX_WRITES_PER_TURN:
+                    raise ToolError("write_limit", f"at most {MAX_WRITES_PER_TURN} changes per message")
+            if tool.precheck:
+                tool.precheck(ctx, parsed)
+        except ToolError as e:
+            return _error(tool.name, e.code, e.message, tool.mutating), None
+        return None, parsed.model_dump(mode="json")
 
     @staticmethod
     def _parse_args(tool: Tool, args: Any) -> ArgsBase:
