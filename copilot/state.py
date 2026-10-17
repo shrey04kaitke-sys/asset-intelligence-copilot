@@ -146,6 +146,25 @@ class StateStore:
             (conversation_id, user_id, limit))
         return [dict(r) for r in reversed(rows.fetchall())]
 
+    def conversations(self, user_id: str, limit: int = 50) -> list[dict]:
+        """A user's own conversations, newest first (never anyone else's)."""
+        rows = self.c.execute("SELECT conversation_id, title, started_at FROM conversations WHERE user_id=? ORDER BY started_at DESC, rowid DESC LIMIT ?", (user_id, limit))
+        return [dict(r) for r in rows]
+
+    def messages(self, conversation_id: str, user_id: str, limit: int = 100) -> list[dict]:
+        """Messages of one of the user's conversations, oldest first, with the stored structured response of assistant turns."""
+        rows = self.c.execute("SELECT role, content, response_json, created_at FROM messages WHERE conversation_id=? AND user_id=? ORDER BY id LIMIT ?", (conversation_id, user_id, limit))
+        out = []
+        for r in rows:
+            d = {"role": r["role"], "content": r["content"], "created_at": r["created_at"], "response": None}
+            if r["response_json"]:
+                try:
+                    d["response"] = json.loads(r["response_json"])
+                except ValueError:
+                    pass
+            out.append(d)
+        return out
+
     def remember(self, *, user_id: str, conversation_id: str | None, topic: str, question: str, entity_ids: list[str],
                  window: dict | None, tool_name: str) -> None:
         with self.c:

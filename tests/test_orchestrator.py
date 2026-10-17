@@ -487,3 +487,55 @@ def test_choose_visual_tool_mode_is_still_available(dom, fb, state, registry):
     r = ask(o, "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")
     assert "choose_visual" in {t["name"] for t in prov.calls[0]["tools"]} and "call choose_visual" in prov.calls[0]["system"]
     assert r.visual["type"] == "table" and len(prov.calls) == 3
+
+
+# ============================================================================ citation parsing (formats seen from the real model)
+from copilot.orchestrator import parse_citations  # noqa: E402
+
+POOL = {"inspection:INS-0001-0202": 1, "inspection:INS-0001-0203": 1, "note:CTX-0001-003": 1, "reg_event:REG-0001-001": 1}
+
+
+@pytest.mark.parametrize("text,out,valid,invalid", [
+    ("Down [inspection:INS-0001-0203].", "Down [inspection:INS-0001-0203].", ["inspection:INS-0001-0203"], []),
+    # comma list in ONE bracket (observed from Gemma 4)
+    ("Off on 8 and 15 Oct [inspection:INS-0001-0202, inspection:INS-0001-0203].", "Off on 8 and 15 Oct [inspection:INS-0001-0202] [inspection:INS-0001-0203].",
+     ["inspection:INS-0001-0202", "inspection:INS-0001-0203"], []),
+    ("A [inspection:INS-0001-0202; note:CTX-0001-003] B", "A [inspection:INS-0001-0202] [note:CTX-0001-003] B", ["inspection:INS-0001-0202", "note:CTX-0001-003"], []),
+    # a tool name is not evidence (observed from Gemma 4)
+    ("21 days [get_downtime: summary].", "21 days.", [], ["get_downtime: summary"]),
+    ("21 days [get_downtime: summary] [inspection:INS-0001-0203]", "21 days [inspection:INS-0001-0203]", ["inspection:INS-0001-0203"], ["get_downtime: summary"]),
+    # mixed good and invented refs in one bracket
+    ("X [inspection:INS-0001-0203, inspection:INS-9999-0001]", "X [inspection:INS-0001-0203]", ["inspection:INS-0001-0203"], ["inspection:INS-9999-0001"]),
+    # spacing variants
+    ("X [inspection: INS-0001-0203]", "X [inspection:INS-0001-0203]", ["inspection:INS-0001-0203"], []),
+    ("X [ note:CTX-0001-003 ]", "X [note:CTX-0001-003]", ["note:CTX-0001-003"], []),
+    # brackets that are not citations are left alone
+    ("Per the [sic] note and [1] and [see below] and [WELL-0001].", "Per the [sic] note and [1] and [see below] and [WELL-0001].", [], []),
+    ("duplicate [note:CTX-0001-003] and again [note:CTX-0001-003]", "duplicate [note:CTX-0001-003] and again [note:CTX-0001-003]", ["note:CTX-0001-003"], []),
+])
+def test_parse_citations_formats(text, out, valid, invalid):
+    new, v, bad = parse_citations(text, POOL)
+    assert (new, v, bad) == (out, valid, invalid)
+
+
+def test_comma_list_citations_count_as_citations_end_to_end(dom, fb, state, registry):
+    txt = "Not producing on 8 and 15 Oct [inspection:INS-0001-0202, inspection:INS-0001-0203]. 21 days [get_downtime: summary]."
+    o, _ = make(dom, fb, state, registry, [mk(calls=[("get_inspection_series", {"asset_id": "WELL-0001", "window": {"last_n": 13, "unit": "weeks"}})]), mk(text=txt)])
+    r = ask(o, "Show a line chart of WELL-0001 for the last 13 weeks.")
+    assert [c.ref for c in r.citations] == ["inspection:INS-0001-0202", "inspection:INS-0001-0203"]
+    assert "get_downtime" not in r.answer and not any("no citations" in w for w in r.warnings) and any("1 citation(s)" in w and "removed" in w for w in r.warnings)
+
+
+def test_supporting_evidence_is_always_listed_even_when_the_model_cites_badly(dom, fb, state, registry):
+    o, _ = make(dom, fb, state, registry, [mk(calls=[("get_downtime", {"scope": {"asset_ids": ["WELL-0001"]}, "window": {"calendar_year": 2025}})]), mk(text="21 days [get_downtime: summary].")])
+    r = ask(o, "How many days was WELL-0001 down in 2025?")
+    assert r.citations == []                                                           # the model cited only a tool name, which is rejected
+    assert {c.fields["at"][:10] for c in r.supporting if c.type == "inspection"} == {"2025-07-24", "2025-10-16", "2025-10-23"}   # the three weeks counted
+    assert all(c.title and c.kind for c in r.supporting) and len(r.supporting) <= 30
+    assert any(w for w in r.warnings if "no citations" in w)
+
+
+def test_supporting_evidence_excludes_what_the_answer_already_cites(dom, fb, state, registry):
+    o, _ = make(dom, fb, state, registry, [mk(calls=[STATUS]), mk(text=f"Not producing [{FIRST_REF}].")])
+    r = ask(o)
+    assert FIRST_REF in {c.ref for c in r.citations} and FIRST_REF not in {c.ref for c in r.supporting} and r.supporting

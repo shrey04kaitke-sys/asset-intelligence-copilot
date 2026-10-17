@@ -95,6 +95,7 @@ class AskResponse(BaseModel):
     answer: str | None = None
     citations: list[Citation] = []
     evidence_consulted: int = 0
+    supporting: list[Citation] = []      # records the tools returned for this answer that the text did not cite (never model-written)
     visual: dict[str, Any] | None = None
     visual_note: str | None = None
     visual_source: dict[str, Any] | None = None
@@ -104,6 +105,7 @@ class AskResponse(BaseModel):
     warnings: list[str] = []
     needs_confirmation: list[str] = []
     pending_actions: list[PendingAction] = []
+    actions_taken: list[str] = []        # changes this request recorded (also listed when a later step failed, so nothing is repeated blindly)
     data: dict[str, Any] = {}
     trace: list[TraceStep] = []
     usage: UsageTotals = UsageTotals()
@@ -140,6 +142,42 @@ class OrchestratorConfig:
 
 # ================================================================================ small deterministic helpers
 REF = re.compile(r"\[([a-z_]+:[^\]\s]+)\]")
+_BRACKET = re.compile(r"\[([^\[\]\n]{2,400})\]")
+_REF_TOKEN = re.compile(r"^[a-z_]+:[^\s,;\[\]]+$")
+_REF_START = re.compile(r"^[a-z_]+\s*:", re.I)
+
+
+def parse_citations(text: str, pool) -> tuple[str, list[str], list[str]]:
+    """Normalise the model's citation brackets against the evidence it was actually given.
+
+    Accepts one ref per bracket or several separated by commas/semicolons; rewrites each group as individual `[ref]`
+    brackets; drops anything that is not a retrieved evidence ref (invented ids, tool names such as `[get_downtime: summary]`).
+    Brackets that do not start like a citation (`[sic]`, `[1]`) are left untouched. Returns (text, valid refs, rejected tokens).
+    """
+    valid: list[str] = []
+    invalid: list[str] = []
+
+    def fix(m: re.Match) -> str:
+        content = m.group(1).strip()
+        if not _REF_START.match(content) or content.lower().startswith("visual"):
+            return m.group(0)                                  # not a citation (`[sic]`, `[1]`, a mid-text `[visual: x]`): leave it alone
+        keep: list[str] = []
+        for tok in (t.strip() for t in re.split(r"[;,]", content)):
+            if not tok:
+                continue
+            norm = re.sub(r"^([a-z_]+)\s*:\s*", r"\1:", tok, flags=re.I)
+            if _REF_TOKEN.match(norm) and norm in pool:
+                keep.append(norm)
+                if norm not in valid:
+                    valid.append(norm)
+            else:
+                invalid.append(tok)
+        return " ".join(f"[{k}]" for k in keep)
+
+    out = _BRACKET.sub(fix, text)
+    out = re.sub(r"[ \t]+([.,;:!?])", r"\1", out)             # tidy the space left where a rejected citation was removed
+    out = re.sub(r"[ \t]{2,}", " ", out)
+    return out, valid, invalid
 _VISUAL_PATTERNS = [
     (r"\bheat ?map\b", "heatmap"), (r"\b(status\s+)?card\b", "card"), (r"\btable\b", "table"), (r"\bline\s+(chart|graph|plot)\b", "line"),
     (r"\bbar\s+(chart|graph)\b", "bar"), (r"\bmap\b", "map"), (r"\btimeline\b", "timeline"), (r"\b(pie|donut|doughnut)(\s+chart)?\b", "donut"),
@@ -425,11 +463,7 @@ class Orchestrator:
             run.chosen_type = mark.group(1).lower()
             text = text[: mark.start()].rstrip()
         warnings: list[str] = list(run.notes)
-        cited = list(dict.fromkeys(REF.findall(text)))
-        valid = [r for r in cited if r in run.pool]
-        invalid = [r for r in cited if r not in run.pool]
-        for r in invalid:
-            text = re.sub(r"\s*\[" + re.escape(r) + r"\]", "", text)
+        text, valid, invalid = parse_citations(text, run.pool)
         if invalid:
             warnings.append(f"{len(invalid)} citation(s) the model gave did not match any retrieved evidence and were removed")
         if run.pool and not valid and any(c.env and c.env.ok for c in run.calls.values()):
@@ -449,16 +483,17 @@ class Orchestrator:
         self._remember(run, req, ok_envs)
         conv = run.conversation_id
         self.state.add_message(conv, req.user_id, "user", req.question)
-        self.state.add_message(conv, req.user_id, "assistant", text, {"tools": [c.name for c in run.calls.values()], "citations": valid, "visual": (vsource or {}).get("type")})
         run.usage.seconds = round(time.perf_counter() - run.started, 3)
         self.state.audit(req.user_id, "ask", "conversation", conv or "", {"tools": [c.name for c in run.calls.values()], "model_calls": run.usage.model_calls,
                                                                           "tool_calls": run.usage.tool_calls, "ok": True, "pending": [p.proposal_id for p in run.pending]})
-        return AskResponse(
+        resp = AskResponse(
             ok=True, conversation_id=conv, question=req.question, answer=text, citations=[self._citation(run.pool[r]) for r in valid],
-            evidence_consulted=len(run.pool), visual=visual, visual_note=vnote, visual_source=vsource, uncertainty=uncertainty, conflicts=conflicts,
-            assumptions=assumptions, warnings=warnings, needs_confirmation=confirm, pending_actions=run.pending,
+            evidence_consulted=len(run.pool), supporting=self._supporting(run, valid), visual=visual, visual_note=vnote, visual_source=vsource, uncertainty=uncertainty, conflicts=conflicts,
+            assumptions=assumptions, warnings=warnings, needs_confirmation=confirm, pending_actions=run.pending, actions_taken=self._actions(run),
             data={"as_of": self.domain.as_of.isoformat(), "as_of_basis": self.domain.as_of_basis, "last_ingest_at": self.domain.last_ingest_at},
             trace=run.trace, usage=run.usage, model=self.provider.model, thinking=thinking)
+        self.state.add_message(conv, req.user_id, "assistant", text, resp.model_dump(mode="json"))     # the whole structured answer, so a resumed investigation restores its charts and citations
+        return resp
 
     def _pick_visual(self, run: _Run, requested: str | None):
         env, src = None, None
@@ -537,6 +572,21 @@ class Orchestrator:
             n += 1
 
     @staticmethod
+    def _supporting(run: _Run, cited: list[str]) -> list[Citation]:
+        """Evidence the tools returned for the data behind this answer, newest result first, minus what the text already cites."""
+        seen, out = set(cited), []
+        for c in reversed(list(run.calls.values())):
+            if not (c.env and c.env.ok) or c.name in ("recall_my_context", "get_fleet_overview", "get_rules"):
+                continue
+            for e in c.env.evidence:
+                if e.ref not in seen:
+                    seen.add(e.ref)
+                    out.append(Orchestrator._citation(e))
+                if len(out) >= 30:
+                    return out
+        return out
+
+    @staticmethod
     def _citation(e: EvidenceItem) -> Citation:
         fields = dict(list(e.fields.items())[:10])
         return Citation(ref=e.ref, type=e.type, id=e.id, title=e.title, kind=e.kind, path=e.path, fields=json.loads(json.dumps(fields, default=str)))
@@ -548,11 +598,29 @@ class Orchestrator:
             turns.pop(0)
         return turns
 
+    @staticmethod
+    def _actions(run: _Run) -> list[str]:
+        out = []
+        for c in run.calls.values():
+            if not (c.env and c.env.ok and c.env.mutating):
+                continue
+            s = c.env.summary
+            if c.name == "record_correction":
+                out.append(f"recorded correction {s.get('correction_id')} on {s.get('inspection_id')} ({s.get('field')}: {s.get('original_value')} → {s.get('new_value')})")
+            elif c.name == "record_rule_override":
+                out.append(f"recorded rule {s.get('correction_id')} ({s.get('rule_key')} = {s.get('new')} for {s.get('scope')})")
+            elif c.name == "record_claim":
+                out.append(f"recorded claim {s.get('claim_id')} on {s.get('asset_id')} ({s.get('visibility')}, {s.get('verification')})")
+        return out
+
     def _fail(self, run: _Run, code: str, message: str, thinking=None, retry_after: float | None = None) -> AskResponse:
         run.usage.seconds = round(time.perf_counter() - run.started, 3)
+        actions = self._actions(run)
+        if actions:
+            message = f"{message} Note: this request had already recorded: " + "; ".join(actions) + ". Do not repeat that message."
         try:
             self.state.audit(run.req.user_id, "ask_failed", "conversation", run.conversation_id or "", {"code": code, "model_calls": run.usage.model_calls, "tool_calls": run.usage.tool_calls})
         except Exception:                                            # pragma: no cover
             pass
         return AskResponse(ok=False, conversation_id=run.conversation_id, question=run.req.question, trace=run.trace, usage=run.usage, model=getattr(self.provider, "model", None),
-                           thinking=thinking, pending_actions=run.pending, error=ErrorInfo(code=code, message=message[:500], retry_after_s=retry_after))
+                           thinking=thinking, pending_actions=run.pending, actions_taken=actions, error=ErrorInfo(code=code, message=message[:700], retry_after_s=retry_after))

@@ -249,6 +249,22 @@ class Domain:
         expl = self.explain_nonproducing(a, li, viewer) if li["producing"] is False else {"items": [], "observation": None}
         for it in expl["items"]:
             evidence.append(it["evidence"])
+        today = self.as_of.isoformat()
+        in_expl = {it["id"] for it in expl["items"]}
+        upcoming: list[dict] = []
+        for c in self.state.claims(a["asset_id"], viewer):
+            if c["claim_type"] in ("planned_shutdown", "status_not_producing") and c["claim_id"] not in in_expl and (not c["valid_to"] or c["valid_to"][:10] >= today):
+                upcoming.append({"kind": "claim", "id": c["claim_id"], "text": f"claim {c['claim_id']} by {self.user_name(c['author_user_id'])} ({c['verification']}): {c['text']}"
+                                 + (f" [from {c['valid_from'][:10]}" + (f" to {c['valid_to'][:10]}]" if c["valid_to"] else "]") if c["valid_from"] else ""),
+                                 "evidence": ev("claim", c["claim_id"], f"Claim {c['claim_id']}", {"author": self.user_name(c["author_user_id"]), "text": c["text"], "verification": c["verification"],
+                                                                                                   "visibility": c["visibility"], "valid_from": c["valid_from"], "valid_to": c["valid_to"]}, None, "claim")})
+        for n in self.src.execute("SELECT * FROM notes WHERE asset_id=? AND note_type IN (?,?) AND (valid_to IS NULL OR valid_to>=?) AND (valid_from IS NOT NULL AND valid_from>?) ORDER BY created_at",
+                                  (a["asset_id"], *STATUS_NOTE_TYPES, today, li["date"])):
+            if n["note_id"] not in in_expl and STOP_HINT.search(n["text"]) and not INS_REF.search(n["text"]):
+                upcoming.append({"kind": "note", "id": n["note_id"], "text": f"note {n['note_id']} by {self.user_name(n['author_user_id'])}: {n['text']} [from {n['valid_from']}" + (f" to {n['valid_to']}]" if n["valid_to"] else "]"),
+                                 "evidence": ev("note", n["note_id"], f"Note {n['note_id']}", {"author": self.user_name(n["author_user_id"]), "text": n["text"], "valid_from": n["valid_from"], "valid_to": n["valid_to"]},
+                                                f"assets/{a['asset_id']}/context.jsonl", "note")})
+        evidence += [u["evidence"] for u in upcoming]
         warnings = []
         stale = None
         rs = a["recorded_status"]
@@ -272,7 +288,7 @@ class Domain:
         fr = self.freshness(li)
         return {"asset": a, "latest": li, "producing": li["producing"], "delta_c": li["delta_c"], "threshold": thr.value if thr else None,
                 "recorded_status": rs, "stale_recorded_status": stale, "explanations": expl["items"],
-                "inspector_observation": expl["observation"], "observation_conflict": obs_conflict,
+                "inspector_observation": expl["observation"], "observation_conflict": obs_conflict, "upcoming": upcoming,
                 "no_recorded_reason": li["producing"] is False and not expl["items"],
                 "evidence": evidence, "warnings": warnings, "freshness": fr}
 

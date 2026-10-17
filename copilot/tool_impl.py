@@ -166,6 +166,8 @@ def h_status(ctx: ToolContext, args: AssetArgs) -> Out:
                          if st["threshold"] is not None else f"{asset['asset_id']}: no production threshold rule is available for {asset['well_type']}. [{insp_ref}]")
     for e in st["explanations"]:
         out.narrative.append(f"Recorded context: {e['text']} [{e['evidence']['ref']}]")
+    for u in st.get("upcoming", []):
+        out.narrative.append(f"Planned or upcoming: {u['text']} [{u['evidence']['ref']}]")
     if st["no_recorded_reason"]:
         out.narrative.append("No recorded reason explains the stop (no open repair, valid note or claim); a field check is suggested.")
     if st["inspector_observation"]:
@@ -200,7 +202,7 @@ def h_status(ctx: ToolContext, args: AssetArgs) -> Out:
     out.summary = {"asset_id": asset["asset_id"], "producing": prod, "delta_c": li["delta_c"], "threshold_c": st["threshold"], "latest_inspection": li["inspection_id"],
                    "inspected_at": li["inspected_at"], "inspector": who, "method": li["method"], "recorded_status": asset["recorded_status"],
                    "recorded_status_stale": bool(st["stale_recorded_status"]), "no_recorded_reason": st["no_recorded_reason"],
-                   "reasons": [e["text"] for e in st["explanations"]], "inspector_note": st["inspector_observation"], "corrections": [c["correction_id"] for c in li["applied_corrections"]]}
+                   "reasons": [e["text"] for e in st["explanations"]], "planned_or_upcoming": [u["text"] for u in st.get("upcoming", [])], "inspector_note": st["inspector_observation"], "corrections": [c["correction_id"] for c in li["applied_corrections"]]}
     return out
 
 
@@ -226,13 +228,29 @@ def h_list_status(ctx: ToolContext, a: ListStatusArgs) -> Out:
         trows.append({"asset_id": r["asset_id"], "area": r["area"], "well_type": r["well_type"], "delta_c": r["delta_c"], "threshold_c": r["threshold_c"],
                       "producing": _yn(r["producing"]), "recorded_status": r["recorded_status"] + (" (out of date)" if r["stale_recorded_status"] else ""),
                       "reason": reason, "inspected": r["inspected_at"][:10], "_ref": f"inspection:{r['inspection_id']}"})
+    excluded: list[dict] = []
+    if a.state == "not_producing":                       # say why a well vanished: its latest reading was corrected into "producing"
+        for r in d.fleet_status(asset_ids=ids, only="producing", viewer=ctx.user_id)["rows"]:
+            if not r["corrections"]:
+                continue
+            ins = ctx.feedback.inspection(r["inspection_id"])
+            raw = ins["raw_values"]
+            if raw["wellhead_temp_c"] is None or raw["ambient_temp_c"] is None or ins["threshold_c"] is None or raw["wellhead_temp_c"] - raw["ambient_temp_c"] >= ins["threshold_c"]:
+                continue
+            c = next((x for x in ins["applied_corrections"] if x["field"] in ("wellhead_temp_c", "ambient_temp_c")), ins["applied_corrections"][0])
+            excluded.append({"asset_id": r["asset_id"], "correction_id": c["correction_id"], "author": c["author_name"], "field": c["field"], "original": c["original"], "new": c["new"], "reason": c["reason"]})
     n_np = sum(1 for r in rows if r["producing"] is False)
     n_p = sum(1 for r in rows if r["producing"] is True)
     n_nr = sum(1 for r in rows if r.get("no_recorded_reason"))
     n_st = sum(1 for r in rows if r["stale_recorded_status"])
     out = Out(summary={"scope": label, "wells_in_scope": len(ids), "listed": len(rows), "producing": n_p, "not_producing": n_np, "not_producing_without_reason": n_nr,
-                       "recorded_status_out_of_date": n_st, "filter": a.state},
+                       "recorded_status_out_of_date": n_st, "filter": a.state, "excluded_by_correction": excluded},
               rows=trows, evidence=f["evidence"], assumptions=asm, entities=[r["asset_id"] for r in rows])
+    for x in excluded:
+        out.narrative.append(f"{x['asset_id']} is not listed: its latest reading was corrected ({x['correction_id']} by {x['author']}: {x['field']} {x['original']} → {x['new']}, {x['reason']}), "
+                             f"which now shows it producing; the original reading showed it not producing. [correction:{x['correction_id']}]")
+        out.warnings.append(f"{x['asset_id']} is excluded from this list because its latest reading was corrected ({x['correction_id']})")
+        out.evidence.append(ev("correction", x["correction_id"], f"Correction {x['correction_id']}", {k: x[k] for k in ("author", "field", "original", "new", "reason")}, None, "correction"))
     out.narrative.append(f"{label}: {len(ids)} wells; by their latest inspections {n_p} producing, {n_np} not producing ({n_nr} with no recorded reason); "
                          f"{n_st} have an out-of-date recorded status.")
     for r in trows[:15]:
@@ -333,6 +351,18 @@ def h_spills(ctx: ToolContext, a: SpillsArgs) -> Out:
     out.rows = trows
     for r in trows[:12]:
         out.narrative.append(f"{r['date']} {r['asset_id']}: {r['volume_bbl']} bbl ({r['class']}), {r['status']} [{r['_ref']}]")
+    reportable = []
+    for r in [x for x in counted if x["class"] in ("reportable", "major")][:15]:       # a reportable spill carries a regulator-notice deadline; state where it stands
+        comp = ctx.domain.spill_compliance(r)
+        k = next((c for c in comp["checks"] if c["protocol"] == "SR-01"), None)
+        reportable.append({"asset_id": r["asset_id"], "inspection_id": r["inspection_id"], "date": r["date"], "volume_bbl": r["volume_bbl"], "class": r["class"], "sr01": k["verdict"] if k else "unknown",
+                           "sr01_detail": k["detail"] if k else "no SR-01 rule available"})
+        out.evidence += comp["evidence"]
+        out.narrative.append(f"Reportable spill {r['asset_id']} {r['volume_bbl']:g} bbl on {r['date']}: {k['detail'] if k else 'no SR-01 rule available'}"
+                             + (" — a written notice is required within the SOP deadline and none is recorded" if k and k["verdict"] == "no_report_on_record_overdue" else "") + f" [inspection:{r['inspection_id']}]")
+        if k and k["verdict"] in ("breached", "no_report_on_record_overdue"):
+            out.warnings.append(f"reportable spill at {r['asset_id']} ({r['volume_bbl']:g} bbl, {r['date']}): SR-01 {k['verdict'].replace('_', ' ')}")
+    out.summary["reportable"] = reportable
     refs = [r["_ref"] for r in trows]
     cols = [("date", "Date", None), ("asset_id", "Well", None), ("area", "Area", None), ("volume_bbl", "Volume", "bbl"), ("class", "Class", None), ("status", "Status", None),
             ("inspection_id", "Inspection", None), ("repairs", "Repairs", None), ("regulatory_events", "Regulator events", None)]
@@ -1016,7 +1046,7 @@ def all_tools() -> list[Tool]:
         T("get_maintenance", "Repairs and their costs for a scope/window, optionally filtered by type or equipment, or summed per well. A repair belongs to the period of its start date.", MaintenanceArgs, h_maintenance),
         T("get_spill_heatmap", "Spill counts by area x month for a window (corrected detections excluded). Use for heatmaps of area by month.", HeatmapArgs, h_heatmap),
         T("get_asset_timeline", "Chronology for ONE well: non-producing weeks, spills, repairs, regulator events and notes. Use for 'what happened to WELL-X' or 'what changed and when'.", TimelineArgs, h_timeline),
-        T("get_asset_notes", "Human notes (including corrections and disagreements) and shared claims for ONE well, plus the caller's own private claims.", AssetArgs, h_notes),
+        T("get_asset_notes", "Human notes and claims for ONE well, including PLANNED shutdowns / planned downtime that colleagues have reported, corrections and disagreements, plus the caller's own private claims. Use for 'is any downtime planned', 'what has anyone said or planned for WELL-X'.", AssetArgs, h_notes),
         T("search_documents", "Full-text search of manuals, SOPs and repair reports. Returns untrusted passages with citations; use for questions about procedures or report details not available as structured data.", SearchArgs, h_search),
         T("recall_my_context", "The caller's own earlier questions and the wells they covered (private; never other users'). Use to resolve 'the wells we discussed yesterday'.", RecallArgs, h_recall),
         T("record_correction", "RECORD a user's correction to a raw inspection value (temperature, spill area) or to the AI-estimated spill volume or detection. Keeps the original, author and reason; applies to that inspection for all users. Only when the user's own message states the correction; copy their words into quote.", CorrectionArgs, h_correction, True,
