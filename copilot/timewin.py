@@ -5,7 +5,7 @@ import calendar
 from datetime import date, datetime, timedelta
 from typing import Literal
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 def add_months(d: date, months: int) -> date:
@@ -16,6 +16,7 @@ def add_months(d: date, months: int) -> date:
 
 class TimeWindow(BaseModel):
     """Exactly one style: explicit dates, a trailing period, or a calendar year."""
+    model_config = ConfigDict(extra="forbid")
     start_date: date | None = Field(None, description="Inclusive start (YYYY-MM-DD)")
     end_date: date | None = Field(None, description="Inclusive end (YYYY-MM-DD); default today")
     last_n: int | None = Field(None, ge=1, le=2000, description="Trailing period length")

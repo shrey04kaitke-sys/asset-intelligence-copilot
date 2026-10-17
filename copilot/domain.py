@@ -856,6 +856,48 @@ class Domain:
         evidence = [ev("document", r["doc_id"], r["title"], {"section": r["section"], "snippet": r["snip"]}, r["path"], "document") for r in rs]
         return {"rows": rows, "evidence": _dedupe(evidence)}
 
+    def list_rules(self, well_type: str | None = None) -> list[dict]:
+        """Every rule in force (manual/SOP values with user overrides applied), with provenance."""
+        keys = [r[0] for r in self.src.execute("SELECT DISTINCT rule_key FROM rules WHERE rule_key!='inherits_from' ORDER BY 1")]
+        types = [well_type] if well_type else self.well_types()
+        out, seen = [], set()
+        for k in keys:
+            glob = self.src.execute("SELECT 1 FROM rules WHERE rule_key=? AND scope_kind='global'", (k,)).fetchone()
+            scopes = [("*", None)] if glob else [(t, t) for t in types]
+            for label, wt in scopes:
+                r = self.rule(k, wt)
+                if r is None or (k, label, r.source_doc) in seen:
+                    continue
+                seen.add((k, label, r.source_doc))
+                out.append({"rule_key": k, "applies_to": label, "value": r.value, "unit": r.unit, "source": r.source_doc,
+                            "section": r.section, "origin": r.origin, "excerpt": r.excerpt[:200],
+                            "overridden_by": r.author if r.origin == "user_override" else None, "_evidence": r.evidence()})
+        return out
+
+    def reg_events(self, asset_ids: list[str] | None, window: TimeWindow, event_type: str | None = None, status: str | None = None) -> dict:
+        start, end, label = window.resolve(self.as_of)
+        q, args = "SELECT * FROM reg_events WHERE date<=?", [end.isoformat()]
+        if start:
+            q += " AND date>=?"; args.append(start.isoformat())
+        if asset_ids is not None:
+            if not asset_ids:
+                return {"rows": [], "evidence": [], "total_fines_usd": 0.0, "open_fines_usd": 0.0, "window": {"label": label}}
+            q += f" AND asset_id IN ({','.join('?' * len(asset_ids))})"; args += list(asset_ids)
+        if event_type:
+            q += " AND event_type=?"; args.append(event_type)
+        if status:
+            q += " AND status=?"; args.append(status)
+        rows = [dict(r) for r in self.src.execute(q + " ORDER BY date, event_id", args)]
+        for r in rows:
+            for k in ("src_path", "src_line", "ingested_at"):
+                r.pop(k, None)
+        evidence = [ev("reg_event", r["event_id"], f"{r['event_id']} {r['event_type']}", {
+            "date": r["date"], "agency": r["agency"], "protocol": r["protocol_id"], "fine_usd": r["fine_usd"], "status": r["status"],
+            "detail": r["detail"]}, f"assets/{r['asset_id']}/regulatory-events.jsonl") for r in rows[:80]]
+        return {"rows": rows, "evidence": evidence, "total_fines_usd": sum(r["fine_usd"] or 0 for r in rows),
+                "open_fines_usd": sum(r["fine_usd"] or 0 for r in rows if r["status"] == "open"),
+                "window": {"start": start.isoformat() if start else None, "end": end.isoformat(), "label": label}}
+
     def notes(self, asset_id: str, viewer: str | None) -> dict:
         notes = [dict(r) for r in self.src.execute("SELECT * FROM notes WHERE asset_id=? ORDER BY created_at", (asset_id,))]
         claims = self.state.claims(asset_id, viewer)
