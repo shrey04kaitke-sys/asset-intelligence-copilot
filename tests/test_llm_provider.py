@@ -54,8 +54,18 @@ def api_error(code, message, status="STATUS"):
     return cls(code, {"error": {"code": code, "message": message, "status": status}})
 
 
+class MidRng:
+    """Deterministic jitter: random() == 0.5, so backoff is exactly the base delay."""
+
+    def random(self):
+        return 0.5
+
+
 def prov(script, **kw):
+    from copilot.llm.pacing import Pacer
     sleeps = []
+    kw.setdefault("rng", MidRng())
+    kw.setdefault("pacer", Pacer(0.0, sleep=lambda s: None))          # pacing has its own tests; here only retry sleeps are recorded
     p = GemmaApiProvider(Settings(model=kw.pop("model", "gemma-4-26b-a4b-it")), client=FakeClient(script), sleep=sleeps.append, **kw)
     p.sleeps = sleeps
     return p
@@ -108,7 +118,8 @@ def test_dotenv_formats_and_key_cleaning(tmp_path, monkeypatch):
     f = tmp_path / ".env"
     f.write_bytes(body.encode("utf-16"))                         # what `echo ... > .env` produces in Windows PowerShell 5.1
     for n in ("GEMINI_API_KEY", "COPILOT_MODEL"):
-        monkeypatch.delenv(n, raising=False)
+        monkeypatch.setenv(n, "placeholder")                      # registers the variable so teardown restores/removes it
+        monkeypatch.delenv(n)
     _load_dotenv(f)
     import os
     assert os.environ["GEMINI_API_KEY"] == FAKE_KEY and os.environ["COPILOT_MODEL"] == "gemma-4-31b-it"
@@ -234,7 +245,8 @@ def test_schema_conversion_details():
     (api_error(400, "API key not valid. Please pass a valid API key.", "INVALID_ARGUMENT"), "auth", False),
     (api_error(400, "Invalid JSON payload received. Unknown name", "INVALID_ARGUMENT"), "invalid_request", False),
     (api_error(404, "models/gemma-x is not found", "NOT_FOUND"), "model_not_found", False),
-    (api_error(429, "Resource has been exhausted (e.g. check quota).", "RESOURCE_EXHAUSTED"), "quota", False),
+    (api_error(429, "You exceeded your current quota, please check your plan and billing details.", "RESOURCE_EXHAUSTED"), "rate_limit", True),
+    (api_error(429, "Quota exceeded for metric GenerateRequestsPerDayPerProjectPerModel-FreeTier", "RESOURCE_EXHAUSTED"), "quota", False),
     (api_error(429, "Too many requests, slow down", "RESOURCE_EXHAUSTED"), "rate_limit", True),
     (api_error(500, "Internal error", "INTERNAL"), "server", True),
     (api_error(503, "The model is overloaded", "UNAVAILABLE"), "server", True),

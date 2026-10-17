@@ -85,6 +85,7 @@ class UsageTotals(BaseModel):
 class ErrorInfo(BaseModel):
     code: str
     message: str
+    retry_after_s: float | None = None      # when a rate limit caused the failure: how long to wait before asking again
 
 
 class AskResponse(BaseModel):
@@ -281,7 +282,7 @@ class Orchestrator:
             return self._finalize(run, user, text, requested, thinking)
         except LLMError as e:
             run.step("model", name=self.provider.model, ok=False, code=e.kind)
-            return self._fail(run, _LLM_CODES.get(e.kind, "llm_error"), e.message, thinking)
+            return self._fail(run, _LLM_CODES.get(e.kind, "llm_error"), e.message, thinking, retry_after=e.retry_after_s)
         except Exception as e:                                       # never leak internals
             log.exception("orchestration failed (%s)", type(e).__name__)
             return self._fail(run, "internal_error", "the request could not be completed; the failure was logged", thinking)
@@ -533,11 +534,11 @@ class Orchestrator:
             turns.pop(0)
         return turns
 
-    def _fail(self, run: _Run, code: str, message: str, thinking=None) -> AskResponse:
+    def _fail(self, run: _Run, code: str, message: str, thinking=None, retry_after: float | None = None) -> AskResponse:
         run.usage.seconds = round(time.perf_counter() - run.started, 3)
         try:
             self.state.audit(run.req.user_id, "ask_failed", "conversation", run.conversation_id or "", {"code": code, "model_calls": run.usage.model_calls, "tool_calls": run.usage.tool_calls})
         except Exception:                                            # pragma: no cover
             pass
         return AskResponse(ok=False, conversation_id=run.conversation_id, question=run.req.question, trace=run.trace, usage=run.usage, model=getattr(self.provider, "model", None),
-                           thinking=thinking, pending_actions=run.pending, error=ErrorInfo(code=code, message=message[:500]))
+                           thinking=thinking, pending_actions=run.pending, error=ErrorInfo(code=code, message=message[:500], retry_after_s=retry_after))

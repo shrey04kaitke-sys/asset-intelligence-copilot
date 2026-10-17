@@ -9,10 +9,12 @@
 from __future__ import annotations
 
 import logging
+import random
 import time
 from typing import Any, Literal
 
 from .base import RETRYABLE, LLMError, LLMResponse, ToolCall, Turn, Usage, scrub
+from .pacing import Pacer, classify_429, retry_after_seconds
 from ..config import Settings
 from ..credentials import CredentialStoreError
 
@@ -67,17 +69,24 @@ def to_gemini_schema(node: Any) -> dict:
 
 class GemmaApiProvider:
     name = "gemma_api"
+    BASE_BACKOFF_S = 1.5
+    MAX_BACKOFF_S = 30.0
 
     def __init__(self, settings: Settings | None = None, *, model: str | None = None, client: Any = None, timeout_s: float | None = None,
-                 max_retries: int = 2, sleep=time.sleep):
+                 max_retries: int | None = None, sleep=time.sleep, pacer: Pacer | None = None, rng: random.Random | None = None,
+                 max_retry_wait_s: float | None = None, max_total_wait_s: float | None = None):
         self.settings = settings or Settings()
         self.model = (model or self.settings.model or "").strip()
         if not self.model.lower().startswith("gemma-"):
             raise LLMError("invalid_request", f"model id '{scrub(self.model, limit=60)}' is not a Gemma model (expected e.g. gemma-4-26b-a4b-it); refusing to run a different model",
                            provider=self.name, model=self.model)
         self.timeout_s = timeout_s or self.settings.llm_timeout_s
-        self.max_retries = max(0, max_retries)
+        self.max_retries = max(0, self.settings.llm_max_retries if max_retries is None else max_retries)
+        self.max_retry_wait_s = self.settings.llm_max_retry_wait_s if max_retry_wait_s is None else max_retry_wait_s
+        self.max_total_wait_s = self.settings.llm_max_total_wait_s if max_total_wait_s is None else max_total_wait_s
         self._sleep = sleep
+        self._rng = rng or random.Random()
+        self.pacer = pacer or Pacer(self.settings.llm_min_interval_s, sleep=sleep)
         if client is None:
             try:
                 key = self.settings.api_key()
@@ -121,26 +130,44 @@ class GemmaApiProvider:
             cfg["thinking_config"] = types.ThinkingConfig(thinking_level=types.ThinkingLevel.HIGH if thinking == "high" else types.ThinkingLevel.MINIMAL)
         config = types.GenerateContentConfig(**cfg)
 
-        attempts, last = 0, None
+        attempts, waited, last = 0, 0.0, None
         while attempts <= self.max_retries:
             attempts += 1
             t0 = time.perf_counter()
             try:
-                resp = self._client.models.generate_content(model=self.model, contents=contents, config=config)
+                with self.pacer.slot():                          # one request at a time, minimum gap between requests
+                    resp = self._client.models.generate_content(model=self.model, contents=contents, config=config)
             except LLMError:
                 raise
             except Exception as e:                              # mapped; the raw exception text is never passed on
                 last = self._map_exception(e)
                 last.attempts = attempts
-                if last.kind in RETRYABLE and attempts <= self.max_retries:
-                    delay = min(8.0, 1.5 * (2 ** (attempts - 1)))
-                    log.warning("gemma call failed (%s), retry %d/%d in %.1fs", last.kind, attempts, self.max_retries, delay)
-                    self._sleep(delay)
-                    continue
-                raise last from None
-            out = self._normalize(resp, time.perf_counter() - t0, attempts, max_output_tokens)
-            return out
+                if last.kind not in RETRYABLE or attempts > self.max_retries:
+                    raise last from None
+                delay = self._retry_delay(e, attempts)
+                if last.kind == "rate_limit":
+                    self.pacer.widen()
+                if delay > self.max_retry_wait_s or waited + delay > self.max_total_wait_s:
+                    last.retry_after_s = delay                  # too long to wait inside one request: tell the caller when to come back
+                    last.message += f" The wait needed (about {delay:.0f}s) is longer than this request may wait, so it was not retried."
+                    raise last from None
+                last.retry_after_s = delay
+                log.warning("gemma call failed (%s), retry %d/%d in %.1fs", last.kind, attempts, self.max_retries, delay)
+                self.pacer.penalize(delay)                       # every waiting caller backs off together
+                self._sleep(delay)
+                waited += delay
+                continue
+            self.pacer.relax()
+            return self._normalize(resp, time.perf_counter() - t0, attempts, max_output_tokens)
         raise last or LLMError("unknown", "no attempt was made", provider=self.name, model=self.model)
+
+    def _retry_delay(self, exc: Exception, attempt: int) -> float:
+        """Seconds to wait before the next attempt. The API's own hint is a floor; otherwise bounded exponential backoff with jitter."""
+        hinted = retry_after_seconds(exc)
+        if hinted is not None:
+            return round(hinted * (1.0 + 0.1 * self._rng.random()), 3)         # never shorter than asked; up to 10% extra spreads callers out
+        base = min(self.MAX_BACKOFF_S, self.BASE_BACKOFF_S * (2 ** (attempt - 1)))
+        return round(base * (0.75 + 0.5 * self._rng.random()), 3)              # +-25% jitter
 
     # ------------------------------------------------------------------ request building
     @staticmethod
@@ -214,8 +241,9 @@ class GemmaApiProvider:
             if code == 404:
                 return LLMError("model_not_found", f"model '{self.model}' was not found for this key ({detail})", status_code=code, **kw)
             if code == 429:
-                quota = any(w in low for w in ("quota", "per day", "daily", "billing"))
-                return LLMError("quota" if quota else "rate_limit", f"rate or quota limit reached ({detail})", status_code=code, **kw)
+                if classify_429(e) == "daily":
+                    return LLMError("quota", f"the daily quota or billing limit is exhausted; waiting will not help ({detail})", status_code=code, **kw)
+                return LLMError("rate_limit", f"the request rate or token rate limit was hit ({detail})", status_code=code, **kw)
             if code == 400:
                 return LLMError("invalid_request", f"the provider rejected the request ({detail})", status_code=code, **kw)
             if code and code >= 500:

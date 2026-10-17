@@ -49,6 +49,13 @@ def _load_dotenv(path: Path) -> None:
 _load_dotenv(ROOT / ".env")
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(os.environ.get(name, default))
+    except ValueError:
+        return default
+
+
 @dataclass
 class Settings:
     dataset_dir: Path = field(default_factory=lambda: Path(os.environ.get("COPILOT_DATASET_DIR", ROOT / "dataset" / "sample-data")))
@@ -59,6 +66,11 @@ class Settings:
     ollama_base_url: str = field(default_factory=lambda: os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"))
     max_tool_steps: int = 6
     llm_timeout_s: float = 90.0
+    # Request pacing / retries for the hosted model API
+    llm_min_interval_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MIN_INTERVAL_S", 1.5))
+    llm_max_retries: int = field(default_factory=lambda: int(_env_float("COPILOT_LLM_MAX_RETRIES", 3)))
+    llm_max_retry_wait_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MAX_RETRY_WAIT_S", 75.0))
+    llm_max_total_wait_s: float = field(default_factory=lambda: _env_float("COPILOT_LLM_MAX_TOTAL_WAIT_S", 150.0))
 
     @property
     def source_db(self) -> Path:

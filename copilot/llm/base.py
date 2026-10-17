@@ -30,9 +30,11 @@ def scrub(text: str, secrets: list[str] | None = None, limit: int = 400) -> str:
 class LLMError(Exception):
     """A failed model call. `message` is safe to show: it never contains credentials."""
 
-    def __init__(self, kind: ErrorKind, message: str, *, status_code: int | None = None, provider: str | None = None, model: str | None = None, attempts: int = 1):
+    def __init__(self, kind: ErrorKind, message: str, *, status_code: int | None = None, provider: str | None = None, model: str | None = None, attempts: int = 1,
+                 retry_after_s: float | None = None):
         super().__init__(message)
         self.kind, self.message, self.status_code, self.provider, self.model, self.attempts = kind, message, status_code, provider, model, attempts
+        self.retry_after_s = retry_after_s          # how long the API (or our policy) says to wait before trying again
 
     @property
     def retryable(self) -> bool:
