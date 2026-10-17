@@ -26,7 +26,7 @@ export async function render(container, { params, isCurrent = () => true }) {
   panels.corrections = h("div", null, h("p", { class: "small muted" }, `${k.corrections.length} on record. Select a reference to see the original value, the author, the reason and the audit history.`),
     k.corrections.length ? h("div", { class: "table-wrap", tabindex: 0, role: "region", "aria-label": "Corrections (scrollable)" }, h("table", null, h("caption", { class: "sr-only" }, "Corrections and rule changes"),
       h("thead", null, h("tr", null, ["Status", "Kind", "Applies to", "Field", "Original", "Now", "By", "When", "Reason", ""].map((t) => h("th", { scope: "col" }, t)))),
-      h("tbody", null, k.corrections.map((c) => h("tr", null, h("td", null, chip(c.status)), h("td", null, c.kind.replace(/_/g, " ")), h("td", null, `${c.scope_kind}: ${c.scope_value}`), h("td", null, c.field),
+      h("tbody", null, k.corrections.map((c) => h("tr", null, h("td", null, chip(c.status), c.orphaned ? [" ", tonedChip("warn", "target no longer in the data")] : null), h("td", null, c.kind.replace(/_/g, " ")), h("td", null, `${c.scope_kind}: ${c.scope_value}`), h("td", null, c.field),
         h("td", null, JSON.stringify(c.original_value)), h("td", null, JSON.stringify(c.new_value)), h("td", null, c.author), h("td", null, fmt.dt(c.created_at)), h("td", null, c.reason || ""),
         h("td", null, refChip(c.ref, onRef, c.correction_id), c.status === "active" ? [" ", h("button", { type: "button", class: "link-btn", onclick: () => withdrawCorrection(c.correction_id) }, "Withdraw")] : null)))))) : emptyState("No corrections yet", "Use “Record a correction” or tell the copilot in the Investigate view."));
 

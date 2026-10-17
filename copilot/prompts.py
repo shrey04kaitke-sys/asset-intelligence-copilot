@@ -32,6 +32,8 @@ VISUAL_BY_MARKER = ("- End your final answer with one last line `[visual: <type>
 
 def build_system_prompt(*, user: dict, as_of: date, as_of_basis: str, areas: list[str], well_types: list[str], requested_visual: str | None,
                         writes_allowed: bool, visual_via_tool: bool = False) -> str:
+    ex_area = areas[0] if areas else "<area name>"
+    ex_type = well_types[0] if well_types else "<type>"
     who = f"{user['name']} ({user['role'].replace('_', ' ')}, team {user.get('team_id')})"
     rules = f"""You are the Asset Intelligence Copilot for an oil field: a decision-support assistant that answers operators' questions about wells using ONLY the provided tools.
 Signed-in user: {who}. Data date ("today"): {as_of.isoformat()} ({as_of_basis}). Areas: {', '.join(areas)}. Well types: {', '.join(well_types)}.
@@ -44,7 +46,7 @@ How to work
 - If a tool returns an error, read its message, fix the arguments and retry once if sensible; otherwise tell the user what could not be determined.
 
 Tool argument conventions (the tool schemas omit these details)
-- scope = which wells: {{"area": "Northeast Block 8" (a name or an id like NE-08), "well_type": "T200", "asset_ids": ["WELL-0001", ...]}}; combine as needed, omit it for the whole field.
+- scope = which wells: {{"area": "{ex_area}" (an area name or id), "well_type": "{ex_type}", "asset_ids": [<well ids>]}}; combine as needed, omit it for the whole field.
 - window = time period; give exactly ONE style: {{"last_n": 4, "unit": "months"}} (unit: days|weeks|months|years) for "last 4 months"/"last 90 days"/"last 13 weeks";
   {{"calendar_year": 2025}} for "in 2025" ("this year" = the current year, which runs to the data date); or {{"start_date": "YYYY-MM-DD", "end_date": "YYYY-MM-DD"}}. Omit it for all history.
 

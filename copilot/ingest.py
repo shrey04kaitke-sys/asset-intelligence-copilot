@@ -336,7 +336,7 @@ def load_manual(run: Run, path: Path, rel: str, sha: str) -> int:
         run.issue("warning", rel, "manual_without_type", "no `well_type = \"...\"` declaration found; no rules extracted")
     _store_doc(run, rel, "manual", text, rel, sha, well_type=types[0] if types else None)
     for r in rules:
-        run.conn.execute("INSERT OR REPLACE INTO rules VALUES (?,?,?,?,?,?,?,?)",
+        run.conn.execute("INSERT OR REPLACE INTO rules(rule_key,scope_kind,scope_value,value_num,unit,source_doc,source_section,excerpt) VALUES (?,?,?,?,?,?,?,?)",
                          (r.rule_key, r.scope_kind, r.scope_value, r.value_num, r.unit, r.source_doc, r.source_section, r.excerpt))
     run.count("manual", "accepted")
     return len(rules)
@@ -348,7 +348,7 @@ def load_sop(run: Run, path: Path, rel: str, sha: str) -> int:
     run.conn.execute("DELETE FROM rules WHERE source_doc=?", (rel,))
     _store_doc(run, rel, "sop", text, rel, sha)
     for r in rules:
-        run.conn.execute("INSERT OR REPLACE INTO rules VALUES (?,?,?,?,?,?,?,?)",
+        run.conn.execute("INSERT OR REPLACE INTO rules(rule_key,scope_kind,scope_value,value_num,unit,source_doc,source_section,excerpt) VALUES (?,?,?,?,?,?,?,?)",
                          (r.rule_key, r.scope_kind, r.scope_value, r.value_num, r.unit, r.source_doc, r.source_section, r.excerpt))
     run.count("sop", "accepted")
     return len(rules)
@@ -498,6 +498,64 @@ def ingest(settings: Settings | None = None, conn: sqlite3.Connection | None = N
     return summary
 
 
+# Plausible ranges for extracted thresholds (lo, hi, unit). A value outside is almost certainly a parsing slip or a typo in a
+# document: it is quarantined (status 'rejected', never applied) and reported, not guessed around.
+RULE_RANGES: dict[str, tuple[float, float]] = {
+    "production.min_delta_c": (0.5, 100), "temp_alarm_c": (30, 400), "spill.shutin_pad_pct": (0.1, 100), "rca.min_corrective_events": (1, 50), "rca.window_months": (1, 120),
+    "downtime.report_after_days": (1, 365), "sr01.report_hours": (0.25, 720), "sr01.major_report_hours": (0.25, 720), "sr02.contain_hours": (0.25, 720),
+    "sr03.tph_target_pct": (0.01, 100), "sr03.min_soil_samples": (1, 100), "sr03.verify_days": (1, 730), "rc01.max_inspection_gap_days": (1, 365),
+    "rc03.report_after_days": (1, 365), "rc04.nov_response_days": (1, 365), "spill.moderate_hse_notice_hours": (0.25, 720),
+    "spill.class.moderate_min_bbl": (0.01, 100000), "spill.class.reportable_min_bbl": (0.01, 100000), "spill.class.major_min_bbl": (0.01, 100000),
+}
+
+
+def _validate_rules(run: Run) -> None:
+    c = run.conn
+    c.execute("UPDATE rules SET status='ok', status_reason=NULL")
+    for r in c.execute("SELECT * FROM rules WHERE rule_key!='inherits_from'").fetchall():
+        rng = RULE_RANGES.get(r["rule_key"])
+        if rng and r["value_num"] is not None and not (rng[0] <= r["value_num"] <= rng[1]):
+            why = f"{r['value_num']:g} {r['unit'] or ''} is outside the plausible range {rng[0]:g}..{rng[1]:g}".replace("  ", " ")
+            c.execute("UPDATE rules SET status='rejected', status_reason=? WHERE rule_key=? AND scope_kind=? AND scope_value=? AND source_doc=?", (why, r["rule_key"], r["scope_kind"], r["scope_value"], r["source_doc"]))
+            run.issue("error", r["source_doc"], "rule_out_of_range", f"{r['rule_key']} ({r['scope_kind']} {r['scope_value']}) = {why}; the rule was not applied. Passage: {r['excerpt'][:120]}")
+    cls = {r["rule_key"]: r["value_num"] for r in c.execute("SELECT rule_key, value_num FROM rules WHERE status='ok' AND rule_key LIKE 'spill.class.%'")}
+    ordered = [cls.get(k) for k in ("spill.class.moderate_min_bbl", "spill.class.reportable_min_bbl", "spill.class.major_min_bbl")]
+    present = [v for v in ordered if v is not None]
+    if len(present) >= 2 and present != sorted(set(present)):
+        c.execute("UPDATE rules SET status='rejected', status_reason='spill class thresholds are not strictly increasing' WHERE rule_key LIKE 'spill.class.%'")
+        run.issue("error", "fleet/sops", "inconsistent_spill_classes", f"spill class thresholds {present} are not strictly increasing; spill classification is unavailable until the SOP is fixed")
+    groups: dict[tuple, dict[str, float]] = {}
+    for r in c.execute("SELECT rule_key, scope_kind, scope_value, source_doc, value_num FROM rules WHERE status='ok' AND rule_key!='inherits_from' ORDER BY source_doc"):
+        groups.setdefault((r["rule_key"], r["scope_kind"], r["scope_value"]), {})[r["source_doc"]] = r["value_num"]
+    for (key, kind, scope), docs in groups.items():
+        if len(set(docs.values())) > 1:
+            run.issue("error", ", ".join(docs), "conflicting_rule", f"documents disagree about {key} ({kind} {scope}): " + "; ".join(f"{d} says {v:g}" for d, v in docs.items())
+                      + ". The rule is unavailable until the documents are reconciled.")
+
+
+def _has_rule(c: sqlite3.Connection, key: str, well_type: str) -> bool:
+    seen, wt = set(), well_type
+    while wt and wt not in seen:
+        seen.add(wt)
+        if c.execute("SELECT 1 FROM rules WHERE rule_key=? AND scope_kind='well_type' AND scope_value=? AND status='ok'", (key, wt)).fetchone():
+            return True
+        p = c.execute("SELECT excerpt FROM rules WHERE rule_key='inherits_from' AND scope_value=?", (wt,)).fetchone()
+        wt = p["excerpt"] if p else None
+    return False
+
+
+def _production_rule_coverage(run: Run) -> None:
+    """Every well type needs a readable 'producing when the wellhead is N degC above ambient' rule, or its wells' status is unknown."""
+    c = run.conn
+    for r in c.execute("SELECT DISTINCT well_type FROM documents WHERE kind='manual' AND well_type IS NOT NULL").fetchall():
+        wt = r[0]
+        if not _has_rule(c, "production.min_delta_c", wt):
+            n = c.execute("SELECT COUNT(*) FROM assets WHERE well_type=?", (wt,)).fetchone()[0]
+            run.issue("warning", f"fleet/well-types ({wt})", "no_production_rule",
+                      f"the manual for well type {wt} has no recognisable production-temperature rule (expected wording like 'at least N °C above ambient'); "
+                      f"production status is unknown for {n} wells of this type until the manual is readable")
+
+
 def _post_checks(run: Run, settings: Settings) -> None:
     c = run.conn
     # "today": explicit override, else the day after the newest inspection (documented assumption)
@@ -533,6 +591,8 @@ def _post_checks(run: Run, settings: Settings) -> None:
                           FROM assets a"""):
         if r["real_id"] and r["lid"] != r["real_id"]:
             run.issue("warning", r["src_path"], "stale_last_inspection", f"{r['asset_id']}: metadata last_inspection {r['lid']} differs from newest inspection {r['real_id']}")
+    _validate_rules(run)
+    _production_rule_coverage(run)
     # rule coverage per well type
     types = [r[0] for r in c.execute("SELECT DISTINCT well_type FROM assets")]
     for wt in types:

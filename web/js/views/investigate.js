@@ -17,7 +17,7 @@ export async function render(container, { params, isCurrent = () => true }) {
   let conversationId = params.c || null;
   const transcript = h("div", { class: "transcript", role: "log", "aria-label": "Investigation", "aria-live": "off" });
   const side = h("div");
-  const input = h("textarea", { id: "q", rows: 3, maxlength: 2000, placeholder: "Ask about wells, inspections, repairs, spills, compliance… or tell the copilot a correction or plan (e.g. \"WELL-0007 will be shut in from 17 Oct\").", "aria-label": "Your question", "aria-describedby": "q-hint" });
+  const input = h("textarea", { id: "q", rows: 3, maxlength: 2000, placeholder: "Ask about wells, inspections, repairs, spills, compliance… or tell the copilot a correction or a plan (for example: \"<well> will be shut in from 17 Oct for a planned workover\").", "aria-label": "Your question", "aria-describedby": "q-hint" });
   if (params.q) input.value = params.q;
   const send = h("button", { type: "submit", class: "btn btn-primary" }, "Ask");
   let busy = false, abort = null, lastQuestion = "";

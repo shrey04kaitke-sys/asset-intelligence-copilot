@@ -169,6 +169,7 @@ def create_app(orchestrator: Orchestrator | None = None, settings: Settings | No
             store = "ok"
         return {"status": "ok" if wells else "no_data", "data_loaded": wells > 0, "wells": wells, "data_date": o.domain.as_of.isoformat(), "model": o.provider.model,
                 "model_key_available": key_source is not None, "credential_store": store, "tools": len(o.registry.names),
+                "rule_conflicts": len(o.domain.rule_conflicts()), "rules_rejected": len(o.domain.rule_rejections()),
                 "note": "decision support only; no live drone, sensor or control integration"}
 
     @app.get("/users")

@@ -19,7 +19,7 @@ from .timewin import TimeWindow, day_bounds
 
 INSPECTION_FIELDS = {"wellhead_temp_c", "ambient_temp_c", "spill_est_volume_bbl", "spill_area_pct", "spill_detected"}
 STATUS_NOTE_TYPES = ("operator_note", "operator_feedback")
-INS_REF = re.compile(r"INS-\d+-\d+")
+INS_REF = re.compile(r"\bINS-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d+\b")
 STOP_HINT = re.compile(r"shut[ -]?in|shutdown|workover|waiting on|restart|outage|planned|tie-in|offline|down for", re.I)
 
 
@@ -139,13 +139,31 @@ class Domain:
         seen, wt = set(), well_type
         while wt and wt not in seen:
             seen.add(wt)
-            r = self.src.execute("SELECT * FROM rules WHERE rule_key=? AND scope_kind='well_type' AND scope_value=?", (key, wt)).fetchone()
-            if r:
+            rows = self.src.execute("SELECT * FROM rules WHERE rule_key=? AND scope_kind='well_type' AND scope_value=? AND status='ok' ORDER BY source_doc", (key, wt)).fetchall()
+            if rows:
+                if len({x["value_num"] for x in rows}) > 1:
+                    return None                                  # documents disagree: ambiguity is never resolved silently (reported by rule_conflicts)
+                r = rows[0]
                 return Rule(key, r["value_num"], r["unit"], r["source_doc"], r["source_section"], r["excerpt"])
             p = self.src.execute("SELECT excerpt FROM rules WHERE rule_key='inherits_from' AND scope_value=?", (wt,)).fetchone()
             wt = p["excerpt"] if p else None
-        r = self.src.execute("SELECT * FROM rules WHERE rule_key=? AND scope_kind='global'", (key,)).fetchone()
-        return Rule(key, r["value_num"], r["unit"], r["source_doc"], r["source_section"], r["excerpt"]) if r else None
+        rows = self.src.execute("SELECT * FROM rules WHERE rule_key=? AND scope_kind='global' AND status='ok' ORDER BY source_doc", (key,)).fetchall()
+        if not rows or len({x["value_num"] for x in rows}) > 1:
+            return None
+        r = rows[0]
+        return Rule(key, r["value_num"], r["unit"], r["source_doc"], r["source_section"], r["excerpt"])
+
+    def rule_conflicts(self) -> list[dict]:
+        """Rules where source documents disagree (these are unavailable until reconciled)."""
+        groups: dict[tuple, list[dict]] = {}
+        for r in self.src.execute("SELECT * FROM rules WHERE status='ok' AND rule_key!='inherits_from' ORDER BY rule_key, scope_kind, scope_value, source_doc"):
+            groups.setdefault((r["rule_key"], r["scope_kind"], r["scope_value"]), []).append({"doc": r["source_doc"], "value": r["value_num"], "unit": r["unit"], "section": r["source_section"], "excerpt": r["excerpt"][:200]})
+        return [{"rule_key": k[0], "scope": f"{k[1]} {k[2]}", "sources": v} for k, v in groups.items() if len({x["value"] for x in v}) > 1]
+
+    def rule_rejections(self) -> list[dict]:
+        """Rules that failed validation at ingestion and are not applied."""
+        return [{"rule_key": r["rule_key"], "scope": f"{r['scope_kind']} {r['scope_value']}", "doc": r["source_doc"], "value": r["value_num"], "reason": r["status_reason"]}
+                for r in self.src.execute("SELECT * FROM rules WHERE status='rejected' ORDER BY rule_key")]
 
     # ------------------------------------------------------------------ effective inspections
     def _correction_maps(self):

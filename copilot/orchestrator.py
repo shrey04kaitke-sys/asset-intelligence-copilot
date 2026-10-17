@@ -187,7 +187,7 @@ _NON_DECLARATIVE_START = re.compile(r"^(show|list|give|tell|what|which|who|whom|
 _MODEL_SLIPS = frozenset({"unknown_tool", "invalid_arguments", "invalid_window", "window_too_wide", "unknown_equipment_kind", "unknown_area", "unknown_well_type"})
 CONFLICT_RE = re.compile(r"disagree|competing|conflict|contradict|out of date|stale|differs|unconfirmed|not match|recorded_status says|inspections are the truth", re.I)
 VISUAL_MARK = re.compile(r"\s*\[\s*visual\s*:\s*([A-Za-z]+)\s*\]\s*$", re.I)
-_ID = re.compile(r"\b[A-Za-z]{1,5}-[A-Za-z0-9-]*\d[A-Za-z0-9-]*\b|\bT\d{3}\b")
+_ID = re.compile(r"\b[A-Za-z]{1,5}-[A-Za-z0-9-]*\d[A-Za-z0-9-]*\b|\b[A-Z]{1,3}\d{2,4}\b")
 _DATE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
 _NUM = re.compile(r"(?<![\w.])-?\d[\d,]*(?:\.\d+)?")
 

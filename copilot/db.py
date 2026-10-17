@@ -11,7 +11,7 @@ from pathlib import Path
 
 from .config import Settings
 
-SOURCE_SCHEMA_VERSION = 1
+SOURCE_SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
 
 SOURCE_DDL = """
@@ -73,8 +73,10 @@ CREATE VIRTUAL TABLE IF NOT EXISTS doc_chunks USING fts5(
 
 CREATE TABLE IF NOT EXISTS rules (
   rule_key TEXT NOT NULL, scope_kind TEXT NOT NULL, scope_value TEXT NOT NULL,
-  value_num REAL, unit TEXT, source_doc TEXT, source_section TEXT, excerpt TEXT,
-  PRIMARY KEY (rule_key, scope_kind, scope_value));
+  value_num REAL, unit TEXT, source_doc TEXT NOT NULL, source_section TEXT, excerpt TEXT,
+  status TEXT NOT NULL DEFAULT 'ok',            -- ok | rejected (failed validation; never applied)
+  status_reason TEXT,
+  PRIMARY KEY (rule_key, scope_kind, scope_value, source_doc));
 
 CREATE TABLE IF NOT EXISTS report_facts (
   maintenance_id TEXT NOT NULL, fact_key TEXT NOT NULL, value_num REAL, value_text TEXT,
@@ -150,6 +152,21 @@ def connect(path: Path, ddl: str, version: int) -> sqlite3.Connection:
 
 
 def open_source(settings: Settings) -> sqlite3.Connection:
+    """The source database is derived from the dataset, so an older schema is discarded and rebuilt (never half-migrated).
+    User state lives in state.db and is untouched."""
+    path = Path(settings.source_db)
+    if path.exists():
+        try:
+            probe = sqlite3.connect(str(path))
+            version = probe.execute("PRAGMA user_version").fetchone()[0]
+            probe.close()
+        except sqlite3.DatabaseError:
+            version = None
+        if version is not None and 0 < version < SOURCE_SCHEMA_VERSION:
+            for suffix in ("", "-wal", "-shm"):
+                p = path.with_name(path.name + suffix)
+                if p.exists():
+                    p.unlink()
     return connect(settings.source_db, SOURCE_DDL, SOURCE_SCHEMA_VERSION)
 
 

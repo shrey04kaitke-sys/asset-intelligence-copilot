@@ -12,7 +12,7 @@ from collections import defaultdict
 from datetime import timedelta
 from typing import Any
 
-from .domain import Domain
+from .domain import INS_REF, Domain
 from .feedback import Feedback
 from .timewin import TimeWindow
 from .tools import ToolContext, ToolRegistry
@@ -169,6 +169,7 @@ class Views:
                     {"label": "Producing", "value": n_prod}, {"label": "Not producing", "value": n_off}] + ([{"label": "No usable inspection", "value": n_unknown}] if n_unknown else []),
                 "by_area": by_area, "by_type": by_type, "compliance": compliance, "attention": attention[:25], "attention_total": len(attention), "recent_events": events,
                 "areas": [{"area_id": k, "name": v["name"]} for k, v in areas.items()], "well_types": d.well_types(),
+                "rule_problems": {"conflicts": d.rule_conflicts(), "rejected": d.rule_rejections()},
                 "note": "Status comes from each well's latest weekly inspection and its well-type rule; the dataset is a snapshot, not a live feed."}
 
     def _recent_events(self, ids: list[str], scope: set[str], user_id: str | None, limit: int = 14) -> list[dict]:
@@ -324,7 +325,8 @@ class Views:
         corrections = []
         for c in reversed(self.state.corrections(active_only=False)[-200:]):
             corrections.append({**{k: c[k] for k in ("correction_id", "kind", "target_type", "target_id", "field", "original_value", "new_value", "scope_kind", "scope_value", "reason", "created_at", "status")},
-                                "author": d.user_name(c["author_user_id"]), "author_id": c["author_user_id"], "ref": f"correction:{c['correction_id']}"})
+                                "author": d.user_name(c["author_user_id"]), "author_id": c["author_user_id"], "ref": f"correction:{c['correction_id']}",
+                                "orphaned": c["target_type"] == "inspection" and d.src.execute("SELECT 1 FROM inspections WHERE inspection_id=?", (c["target_id"],)).fetchone() is None})
         rows = self.state.c.execute("SELECT * FROM claims WHERE visibility='shared' OR author_user_id=? ORDER BY created_at DESC, rowid DESC LIMIT 200", (viewer or "",)).fetchall()
         claims = [{**dict(r), "author": d.user_name(r["author_user_id"]), "ref": f"claim:{r['claim_id']}"} for r in rows]
         return {"corrections": corrections, "claims": claims, "audit": self.audit(object_type=None, object_id=None, viewer=viewer, limit=100)}
@@ -410,7 +412,7 @@ class Views:
         r = self.d.src.execute("SELECT * FROM notes WHERE note_id=?", (ident,)).fetchone()
         if not r:
             raise ViewError(404, "note not found")
-        refs = sorted(set(re.findall(r"INS-\d+-\d+", r["text"])) | ({r["inspection_id"]} if r["inspection_id"] else set()))
+        refs = sorted(set(INS_REF.findall(r["text"])) | ({r["inspection_id"]} if r["inspection_id"] else set()))
         return {"type": "note", "id": ident, "category": "note", "label": "Human note (dataset)", "title": f"Note {ident}", "timestamp": r["created_at"],
                 "source": {"file": r["src_path"], "line": r["src_line"]}, "excerpt": r["text"], "corrections": [],
                 "related": [{"ref": f"inspection:{i}", "title": f"Inspection {i}"} for i in refs],

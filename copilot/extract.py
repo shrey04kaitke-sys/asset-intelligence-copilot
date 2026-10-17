@@ -94,7 +94,7 @@ def parse_manual(text: str, doc_id: str) -> tuple[list[str], list[RuleRow]]:
                 rules.append(RuleRow(key, "well_type", wt, val, unit, doc_id, heading, _excerpt(mm, flat)))
                 break
     flat_all = _norm(text)
-    for rx in (r"follow the (T\w+) manual", r"Same as (T\w+)"):
+    for rx in (r"follow the ([A-Za-z0-9][A-Za-z0-9_-]*) manual", r"Same as ([A-Za-z0-9][A-Za-z0-9_-]*?)(?=\s|[,.;)])"):
         mm = re.search(rx, flat_all)
         if mm and mm.group(1) != wt:
             rules.append(RuleRow("inherits_from", "well_type", wt, None, None, doc_id, "(scope)", mm.group(1)))

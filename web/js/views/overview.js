@@ -51,7 +51,11 @@ export async function render(container, { params, isCurrent = () => true }) {
     d.recent_events.length ? h("ol", { class: "timeline" }, d.recent_events.map((e) => h("li", null, h("time", { datetime: e.date }, e.date), tonedChip(e.kind === "spill" || e.kind === "regulatory" ? "bad" : e.kind === "correction" ? "warn" : "info", e.kind), " ",
       e.asset_id ? h("a", { href: link(`assets/${e.asset_id}`) }, e.asset_id) : null, " ", e.label, e.detail ? h("span", { class: "muted small" }, " — " + e.detail) : null, " ", refChip(e.ref, onRef, "open")))) : emptyState("No recent events"));
 
-  mount(body, filters, kpis, h("div", { class: "grid cols-2 section" }, dist, period), h("section", { class: "panel section" }, h("h3", null, "By area"), areaTable), h("section", { class: "panel section" }, h("h3", null, "By well type"), typeTable),
+  const rp = d.rule_problems || { conflicts: [], rejected: [] };
+  const ruleNotice = (rp.conflicts.length || rp.rejected.length) ? notice("bad", "Rules need review before some answers can be trusted", [
+    ...rp.conflicts.map((c) => `${c.rule_key} (${c.scope}): documents disagree — ${c.sources.map((s) => `${s.doc} says ${s.value}`).join("; ")}. Unavailable until reconciled.`),
+    ...rp.rejected.map((r) => `${r.rule_key} (${r.scope}) from ${r.doc}: ${r.reason}. Not applied.`)]) : null;
+  mount(body, ruleNotice, filters, kpis, h("div", { class: "grid cols-2 section" }, dist, period), h("section", { class: "panel section" }, h("h3", null, "By area"), areaTable), h("section", { class: "panel section" }, h("h3", null, "By well type"), typeTable),
     h("div", { class: "section" }, comp), h("div", { class: "grid cols-2 section" }, attention, events));
   announce(`Fleet overview loaded: ${d.totals[0].value} wells`);
 }

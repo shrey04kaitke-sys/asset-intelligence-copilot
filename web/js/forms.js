@@ -50,7 +50,7 @@ export function correctionForm(pre = {}) {
     spill_area_pct: "Spill area (% of pad) — raw data", spill_detected: "Spill detected (true/false)" };
   const msg = h("div", { "aria-live": "polite" });
   const id = h("input", { id: "f-insp", type: "text", value: pre.inspection_id || "", placeholder: "e.g. INS-0164-0205", autocomplete: "off" });
-  const asset = h("input", { id: "f-asset", type: "text", value: pre.asset_id || "", placeholder: "e.g. WELL-0164", autocomplete: "off" });
+  const asset = h("input", { id: "f-asset", type: "text", value: pre.asset_id || "", placeholder: "well id", autocomplete: "off" });
   const date = h("input", { id: "f-date", type: "date" });
   const fieldSel = h("select", { id: "f-field" }, Object.entries(fields).map(([k, v]) => h("option", { value: k, selected: pre.field === k }, v)));
   const val = h("input", { id: "f-val", type: "text", inputmode: "decimal", required: true, autocomplete: "off" });
@@ -92,7 +92,7 @@ export function claimForm(pre = {}) {
   if (!requireUser()) return;
   const types = { planned_shutdown: "A planned shutdown", status_not_producing: "The well is shut in / not producing", status_producing: "The well is running / producing", observation: "Another observation" };
   const msg = h("div", { "aria-live": "polite" });
-  const asset = h("input", { id: "c-asset", type: "text", value: pre.asset_id || "", required: true, placeholder: "e.g. WELL-0007", autocomplete: "off" });
+  const asset = h("input", { id: "c-asset", type: "text", value: pre.asset_id || "", required: true, placeholder: "well id", autocomplete: "off" });
   const type = h("select", { id: "c-type" }, Object.entries(types).map(([k, v]) => h("option", { value: k }, v)));
   const text = h("textarea", { id: "c-text", rows: 3, required: true, minlength: 3, maxlength: 500, placeholder: pre.text || "Describe what you know, in your own words." });
   if (pre.text) text.value = pre.text;
@@ -126,7 +126,7 @@ export function ruleForm(pre = {}) {
   const key = h("select", { id: "r-key" }, Object.entries(keys).map(([k, v]) => h("option", { value: k }, v)));
   const value = h("input", { id: "r-val", type: "number", step: "1", min: "1", required: true });
   const scope = h("select", { id: "r-scope" }, h("option", { value: "well_type" }, "Every well of a type"), h("option", { value: "asset" }, "One well"));
-  const sv = h("input", { id: "r-sv", type: "text", required: true, placeholder: "e.g. T350 or WELL-0120", value: pre.scope_value || "", autocomplete: "off" });
+  const sv = h("input", { id: "r-sv", type: "text", required: true, placeholder: "well type or well id", value: pre.scope_value || "", autocomplete: "off" });
   const why = h("textarea", { id: "r-why", rows: 3, required: true, minlength: 3, maxlength: 300, placeholder: "Why is the team changing this?" });
   const submit = h("button", { type: "submit", class: "btn btn-primary" }, "Review and apply…");
   const content = [h("h2", { id: "modal-title" }, "Propose a team rule"),
