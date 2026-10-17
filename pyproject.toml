@@ -1,0 +1,22 @@
+[project]
+name = "asset-intelligence-copilot"
+version = "0.1.0"
+description = "Evidence-grounded decision-support copilot for oil-well asset data"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "fastapi>=0.110",
+  "uvicorn>=0.29",
+  "pydantic>=2.6",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["live: needs a live model provider (skipped unless configured)"]
+
+[tool.setuptools.packages.find]
+include = ["copilot*"]

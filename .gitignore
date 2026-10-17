@@ -1,0 +1,9 @@
+# Challenge repo is cloned separately (see README); keep it out of this repository.
+dataset/
+data/
+.env
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+node_modules/
