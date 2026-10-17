@@ -161,3 +161,29 @@ def test_report_fact_extraction_uses_only_text_present():
 def test_rule_parsers_return_nothing_for_unrecognised_text():
     assert parse_sop("| **SR-01** | do something sensible |\n", "x") == []
     assert parse_manual("no declaration here", "x") == ([], [])
+
+
+def test_ingest_command_reports_counts_and_issues_and_signals_errors(mini, tmp_path, monkeypatch, capsys):
+    s, root = mini
+    monkeypatch.setenv("COPILOT_DATA_DIR", str(tmp_path / "cli-data"))
+    from copilot.ingest import main
+    code = main([str(root)])
+    out = capsys.readouterr().out
+    assert code == 1                                                    # the synthetic dataset contains bad records, so the exit code says so
+    assert '"accepted": 2' in out and "bad_json" in out and "duplicate_id" in out and "unknown_asset" in out
+    assert (tmp_path / "cli-data" / "source.db").exists()
+    assert main([str(root)]) == 1 and '"unchanged"' in capsys.readouterr().out
+
+
+def test_incremental_run_still_reports_outstanding_problems_from_earlier_runs(mini):
+    s, root = mini
+    conn = open_source(s)
+    first = ingest(s, conn)
+    assert first["issues"]["error"] == 5 and first["issues_this_run"]["error"] == 5
+    again = ingest(s, conn)
+    assert again["files"]["changed"] == 0 and again["issues_this_run"].get("error", 0) == 0     # nothing was re-parsed ...
+    assert again["issues"]["error"] == 5                                                         # ... but the rejected records are still rejected, and the report says so
+    p = root / "assets" / "WELL-0900" / "inspections.jsonl"
+    jl(p, [ins(1, "2026-03-01T08:00:00Z")])                                                       # the bad lines are fixed
+    fixed = ingest(s, conn)
+    assert fixed["issues"].get("error", 0) == 0

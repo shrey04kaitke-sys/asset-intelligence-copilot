@@ -457,8 +457,7 @@ def ingest(settings: Settings | None = None, conn: sqlite3.Connection | None = N
         sha = sha256_file(p)
         prev = known.get(rel)
         if prev and prev["sha256"] == sha and not force:
-            run.files["unchanged"] += 1
-            conn.execute("UPDATE ingest_files SET last_seen_run=? WHERE path=?", (run.id, rel))
+            run.files["unchanged"] += 1                      # last_seen_run keeps pointing at the run that last PROCESSED this file
             continue
         todo.append((rel, kind, p, sha, prev is not None))
     todo.sort(key=lambda t: (ORDER.index(t[1]), t[0]))
@@ -490,8 +489,8 @@ def ingest(settings: Settings | None = None, conn: sqlite3.Connection | None = N
     summary = {
         "run_id": run.id, "dataset_dir": str(root), "files": run.files, "records": run.counts,
         "as_of": conn.execute("SELECT value FROM meta WHERE key='as_of'").fetchone()[0],
-        "issues": {r["severity"]: r["n"] for r in conn.execute(
-            "SELECT severity, COUNT(*) n FROM ingest_issues WHERE run_id=? GROUP BY severity", (run.id,))},
+        "issues": outstanding_issues(conn, run.id),                                   # everything still wrong with the files currently present
+        "issues_this_run": {r["severity"]: r["n"] for r in conn.execute("SELECT severity, COUNT(*) n FROM ingest_issues WHERE run_id=? GROUP BY severity", (run.id,))},
     }
     conn.execute("UPDATE ingest_runs SET finished_at=?, summary_json=? WHERE id=?", (now_iso(), json.dumps(summary), run.id))
     conn.commit()
@@ -556,6 +555,18 @@ def _production_rule_coverage(run: Run) -> None:
                       f"production status is unknown for {n} wells of this type until the manual is readable")
 
 
+def outstanding_issues(conn: sqlite3.Connection, run_id: int) -> dict[str, int]:
+    """Counts of issues that still apply: those recorded when each *current* file was last processed, plus this run's cross-file checks.
+
+    An incremental run re-parses only changed files, so counting only this run's issues would make known, unresolved problems look fixed."""
+    rows = conn.execute(
+        """SELECT i.severity, COUNT(*) n FROM ingest_issues i
+           WHERE (i.run_id = (SELECT f.last_seen_run FROM ingest_files f WHERE f.path = i.path))
+              OR (i.run_id = ? AND i.path NOT IN (SELECT path FROM ingest_files))
+           GROUP BY i.severity""", (run_id,)).fetchall()
+    return {r["severity"]: r["n"] for r in rows}
+
+
 def _post_checks(run: Run, settings: Settings) -> None:
     c = run.conn
     # "today": explicit override, else the day after the newest inspection (documented assumption)
@@ -599,3 +610,28 @@ def _post_checks(run: Run, settings: Settings) -> None:
         if not c.execute("SELECT 1 FROM documents WHERE kind='manual' AND well_type=?", (wt,)).fetchone():
             run.issue("warning", "fleet/well-types", "no_manual", f"well type {wt} has no manual; production status cannot be derived for these wells")
     c.commit()
+
+
+def main(argv: list[str] | None = None) -> int:
+    """python -m copilot.ingest [DATASET_DIR] [--force]  — load (or incrementally refresh) a dataset into the derived source database."""
+    import argparse
+    ap = argparse.ArgumentParser(description="Ingest a challenge-format dataset (read-only on the dataset; writes data/source.db).")
+    ap.add_argument("dataset_dir", nargs="?", help="folder containing fleet/ and assets/ (default: COPILOT_DATASET_DIR or dataset/sample-data)")
+    ap.add_argument("--force", action="store_true", help="re-parse every file even if unchanged")
+    a = ap.parse_args(argv)
+    settings = Settings()
+    if a.dataset_dir:
+        settings.dataset_dir = Path(a.dataset_dir)
+    summary = ingest(settings, force=a.force)
+    print(json.dumps(summary, indent=1, default=str))
+    conn = open_source(settings)
+    bad = conn.execute("""SELECT i.severity, i.code, COUNT(*) n FROM ingest_issues i
+                          WHERE i.run_id = (SELECT f.last_seen_run FROM ingest_files f WHERE f.path = i.path) OR (i.run_id = ? AND i.path NOT IN (SELECT path FROM ingest_files))
+                          GROUP BY 1,2 ORDER BY 1,3 DESC""", (summary["run_id"],)).fetchall()
+    for r in bad:
+        print(f"  {r['severity']:8} {r['code']:28} x{r['n']}")
+    return 0 if not summary["issues"].get("error") else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
