@@ -103,6 +103,8 @@ class GemmaApiProvider:
     def generate(self, turns: list[Turn], *, system: str | None = None, tools: list[dict] | None = None, temperature: float = 0.2,
                  max_output_tokens: int = 2048, thinking: Literal["minimal", "high"] | None = None,
                  tool_mode: Literal["auto", "any", "none"] = "auto") -> LLMResponse:
+        # NOTE: max_output_tokens also covers the model's hidden reasoning ("thinking"). A cap smaller than the reasoning
+        # leaves no room for the answer (finish_reason=MAX_TOKENS, text=None); see LLMResponse.require_text().
         from google.genai import types
         contents = self._contents(turns, types)
         cfg: dict[str, Any] = {"temperature": temperature, "max_output_tokens": max_output_tokens}
@@ -136,7 +138,7 @@ class GemmaApiProvider:
                     self._sleep(delay)
                     continue
                 raise last from None
-            out = self._normalize(resp, time.perf_counter() - t0, attempts)
+            out = self._normalize(resp, time.perf_counter() - t0, attempts, max_output_tokens)
             return out
         raise last or LLMError("unknown", "no attempt was made", provider=self.name, model=self.model)
 
@@ -161,7 +163,7 @@ class GemmaApiProvider:
         return out
 
     # ------------------------------------------------------------------ response normalisation
-    def _normalize(self, resp: Any, latency: float, attempts: int) -> LLMResponse:
+    def _normalize(self, resp: Any, latency: float, attempts: int, max_output_tokens: int | None = None) -> LLMResponse:
         cands = getattr(resp, "candidates", None) or []
         if not cands:
             pf = getattr(resp, "prompt_feedback", None)
@@ -191,7 +193,7 @@ class GemmaApiProvider:
                       getattr(um, "thoughts_token_count", None), getattr(um, "total_token_count", None)) if um else Usage()
         turn = Turn(role="model", text=text, tool_calls=calls, provider_state=getattr(c, "content", None))
         return LLMResponse(text=text, tool_calls=calls, finish_reason=finish, usage=usage, model=self.model, provider=self.name,
-                           latency_s=round(latency, 3), attempts=attempts, thought_chars=thought_chars, turn=turn)
+                           latency_s=round(latency, 3), attempts=attempts, thought_chars=thought_chars, turn=turn, max_output_tokens=max_output_tokens)
 
     # ------------------------------------------------------------------ errors
     def _map_exception(self, e: Exception) -> LLMError:

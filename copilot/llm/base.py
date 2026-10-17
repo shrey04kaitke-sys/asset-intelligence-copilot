@@ -10,7 +10,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
 
-ErrorKind = Literal["unconfigured", "auth", "model_not_found", "invalid_request", "rate_limit", "quota", "server", "timeout", "network", "blocked", "malformed", "unknown"]
+ErrorKind = Literal["unconfigured", "auth", "model_not_found", "invalid_request", "rate_limit", "quota", "server", "timeout", "network", "blocked", "malformed", "truncated", "unknown"]
 RETRYABLE: set[str] = {"rate_limit", "server", "timeout", "network"}
 
 _KEY_PATTERNS = [re.compile(r"AIza[0-9A-Za-z_\-]{20,}"), re.compile(r"(?i)(key|token|authorization)=([^&\s\"']+)"), re.compile(r"sk-[A-Za-z0-9_\-]{16,}")]
@@ -87,10 +87,30 @@ class LLMResponse:
     attempts: int = 1
     thought_chars: int = 0               # length of hidden reasoning, never exposed to users
     turn: Turn | None = None             # append this to the history to continue the conversation
+    max_output_tokens: int | None = None  # the cap that was requested; hidden reasoning counts against it
 
     @property
     def empty(self) -> bool:
         return not self.text and not self.tool_calls
+
+    @property
+    def truncated(self) -> bool:
+        """The output cap was reached. For thinking models this can happen before any answer text is written."""
+        return self.finish_reason == "MAX_TOKENS"
+
+    def require_text(self) -> str:
+        """Answer text, or a precise LLMError saying why there is none (never returns empty)."""
+        if self.text:
+            return self.text
+        if self.truncated:
+            used = self.usage.thought_tokens
+            raise LLMError("truncated",
+                           f"the output limit (max_output_tokens={self.max_output_tokens}) was reached before any answer text"
+                           + (f"; hidden reasoning used {used} tokens of it" if used else "")
+                           + ". Raise max_output_tokens or lower the thinking level (thinking='minimal'). A continuation is not available: no continuation token was returned.",
+                           provider=self.provider, model=self.model)
+        raise LLMError("malformed", f"the model returned no answer text (finish_reason={self.finish_reason}"
+                       + (", it returned a tool call instead" if self.tool_calls else "") + ")", provider=self.provider, model=self.model)
 
     @property
     def malformed_tool_call(self) -> bool:

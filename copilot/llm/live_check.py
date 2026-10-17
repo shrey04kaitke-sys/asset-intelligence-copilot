@@ -113,19 +113,40 @@ def run_live_check(settings: Settings | None = None, *, include_error_paths: boo
 
     # 2 ---------------------------------------------------------------- plain generation
     def plain():
-        r = prov.generate([Turn("user", "Reply with exactly the single word: pong")], temperature=0.0, max_output_tokens=64)
-        assert r.text, "response contained no text"
+        # Budget note: max_output_tokens also covers the model's hidden reasoning, which was ~60-80 tokens even for this
+        # trivial prompt. A 64-token cap produced finish_reason=MAX_TOKENS with no answer (see the truncation step below).
+        r = prov.generate([Turn("user", "Reply with exactly the single word: pong")], temperature=0.0, max_output_tokens=1024)
+        r.require_text()
         assert "pong" in r.text.lower(), f"unexpected reply: {_trim(r.text, 80)!r}"
         assert (r.usage.total_tokens or 0) > 0, "no token usage reported"
         return {"text": _trim(r.text), "finish": r.finish_reason, "model": r.model, "latency_s": r.latency_s, "usage": asdict(r.usage), "attempts": r.attempts}
     if not step("plain generation (real inference)", True, plain):
         return _finish(rep, out_path)
 
+    # 2b --------------------------------------------------------------- a too-small cap must be reported, not silently empty
+    def tiny_cap():
+        r = prov.generate([Turn("user", "Reply with exactly the single word: pong")], temperature=0.0, max_output_tokens=16)
+        out = {"finish": r.finish_reason, "has_text": bool(r.text), "thought_tokens": r.usage.thought_tokens, "thought_chars": r.thought_chars,
+               "continuation_available": False, "usage": asdict(r.usage)}
+        if r.text:
+            out["note"] = "model answered within 16 tokens this time; nothing to report"
+            return out
+        assert r.truncated, f"empty response but finish_reason={r.finish_reason}, not MAX_TOKENS"
+        try:
+            r.require_text()
+        except LLMError as e:
+            assert e.kind == "truncated"
+            out["reported_as"] = e.kind
+            out["message"] = _trim(e.message, 240)
+            return out
+        raise AssertionError("require_text() did not raise for an empty truncated response")
+    step("small output cap is reported as truncation (observation)", False, tiny_cap)
+
     # 3 ---------------------------------------------------------------- system instruction
     def system():
         r = prov.generate([Turn("user", "What colour is a clear daytime sky?")], system="Answer with exactly one word, written in capital letters, no punctuation.",
-                          temperature=0.0, max_output_tokens=32)
-        assert r.text, "no text"
+                          temperature=0.0, max_output_tokens=1024)
+        r.require_text()
         word = r.text.strip()
         return {"text": _trim(r.text, 60), "followed_instruction": word.isupper() and len(word.split()) == 1, "usage": asdict(r.usage)}
     step("system instruction", False, system)
@@ -134,7 +155,7 @@ def run_live_check(settings: Settings | None = None, *, include_error_paths: boo
     def thinking():
         out = {}
         for lvl in ("minimal", "high"):
-            r = prov.generate([Turn("user", "What is 17 multiplied by 23? Reply with just the number.")], thinking=lvl, temperature=0.0, max_output_tokens=512)
+            r = prov.generate([Turn("user", "What is 17 multiplied by 23? Reply with just the number.")], thinking=lvl, temperature=0.0, max_output_tokens=1024)
             out[lvl] = {"text": _trim(r.text, 60), "correct": bool(r.text and "391" in r.text), "thought_tokens": r.usage.thought_tokens, "thought_chars": r.thought_chars, "latency_s": r.latency_s}
         assert out["minimal"]["text"] or out["high"]["text"], "no text from either setting"
         return out
@@ -144,8 +165,8 @@ def run_live_check(settings: Settings | None = None, *, include_error_paths: boo
     def call_one():
         sys_p = ("You answer questions about oil wells using the provided tools only. Call a tool to get facts; do not guess. "
                  "Use ISO dates and the exact tool argument names.")
-        r = prov.generate([Turn("user", "Is WELL-0001 producing oil right now?")], system=sys_p, tools=specs, temperature=0.0, max_output_tokens=512)
-        assert r.tool_calls, f"model returned no function call (finish={r.finish_reason}, text={_trim(r.text, 80)!r})"
+        r = prov.generate([Turn("user", "Is WELL-0001 producing oil right now?")], system=sys_p, tools=specs, temperature=0.0, max_output_tokens=1024)
+        assert r.tool_calls, f"model returned no function call (finish={r.finish_reason}, truncated={r.truncated}, thought_tokens={r.usage.thought_tokens}, text={_trim(r.text, 80)!r})"
         tc = r.tool_calls[0]
         env = reg.call(tc.name, tc.args, ctx)                     # validated allow-list registry, not the model, executes
         assert tc.name == "get_asset_status", f"expected get_asset_status, got {tc.name}"
@@ -163,7 +184,7 @@ def run_live_check(settings: Settings | None = None, *, include_error_paths: boo
         r1, tc, env, sys_p = call_one.state
         turns = [Turn("user", "Is WELL-0001 producing oil right now?"), r1.turn,
                  Turn("tool", tool_results=[ToolResultMsg(tc.name, model_view(env), tc.id)])]
-        r2 = prov.generate(turns, system=sys_p + " Answer in two sentences using only the tool result.", tools=specs, temperature=0.0, max_output_tokens=400)
+        r2 = prov.generate(turns, system=sys_p + " Answer in two sentences using only the tool result.", tools=specs, temperature=0.0, max_output_tokens=1024)
         assert r2.text, f"no final text after tool result (finish={r2.finish_reason}, tool_calls={[c.name for c in r2.tool_calls]})"
         low = r2.text.lower()
         grounded = ("not producing" in low or "no" in low.split()[:3] or "isn't" in low or "is not" in low) and ("3.2" in r2.text or "ryan" in low or "ctx-0001-003" in low or "shut" in low)
@@ -175,7 +196,7 @@ def run_live_check(settings: Settings | None = None, *, include_error_paths: boo
     # 7 ---------------------------------------------------------------- nested arguments
     def nested():
         r = prov.generate([Turn("user", "Which 3 wells in Northeast Block 7 had the most downtime in the last 4 months?")],
-                          system="Use the provided tools to answer; do not guess. Use exact tool argument names.", tools=specs, temperature=0.0, max_output_tokens=512)
+                          system="Use the provided tools to answer; do not guess. Use exact tool argument names.", tools=specs, temperature=0.0, max_output_tokens=1024)
         assert r.tool_calls, f"no function call (finish={r.finish_reason})"
         tc = r.tool_calls[0]
         env = reg.call(tc.name, tc.args, ctx)

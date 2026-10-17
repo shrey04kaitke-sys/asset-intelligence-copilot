@@ -326,3 +326,41 @@ def test_live_check_reports_not_run_without_key_and_makes_no_network_call(monkey
     assert rep.verdict.startswith("NOT RUN") and not rep.passed() and rep.steps[0].error.startswith("[unconfigured]")
     saved = json.loads((tmp_path / "r.json").read_text())
     assert saved["verdict"].startswith("NOT RUN") and "AIza" not in json.dumps(saved)
+
+
+# ---------------------------------------------------------------------------------------- truncation (MOCKED reproduction of the live shape)
+def test_thought_only_max_tokens_response_is_reported_as_truncation():
+    """Shape observed from the real API with max_output_tokens=64 and default thinking: 200 OK, finish=MAX_TOKENS,
+    one thought-only part, no answer part, thoughts=61 tokens, no continuation token. This mock reproduces the shape only."""
+    secret_thought = "THOUGHT-CONTENT-MUST-NOT-LEAK " + "x" * 180
+    r = prov([resp([{"text": secret_thought, "thought": True}], finish="MAX_TOKENS", usage=(9, None, 70, 61))]).generate(U, max_output_tokens=64)
+    assert r.text is None and r.empty and r.truncated and r.finish_reason == "MAX_TOKENS"
+    assert r.thought_chars == len(secret_thought) and r.usage.thought_tokens == 61 and r.max_output_tokens == 64
+    with pytest.raises(LLMError) as ei:
+        r.require_text()
+    e = ei.value
+    assert e.kind == "truncated" and not e.retryable
+    assert "61" in e.message and "64" in e.message and "max_output_tokens" in e.message and "thinking" in e.message.lower()
+    assert "THOUGHT-CONTENT" not in e.message and "THOUGHT-CONTENT" not in str(e)
+
+
+def test_partial_answer_with_max_tokens_is_flagged_but_usable():
+    r = prov([resp([{"text": "Because the"}], finish="MAX_TOKENS", usage=(9, 3, 12, None))]).generate(U, max_output_tokens=3)
+    assert r.truncated and r.text == "Because the" and r.require_text() == "Because the"
+
+
+def test_require_text_distinguishes_empty_stop_from_truncation():
+    r = prov([resp([], finish="STOP")]).generate(U)
+    assert not r.truncated
+    with pytest.raises(LLMError) as ei:
+        r.require_text()
+    assert ei.value.kind == "malformed" and "STOP" in ei.value.message
+    ok = prov([resp([{"text": "pong"}])]).generate(U)
+    assert ok.require_text() == "pong" and not ok.truncated
+
+
+def test_require_text_is_not_satisfied_by_tool_calls_alone():
+    r = prov([resp([{"function_call": {"name": "get_rules", "args": {}}}])]).generate(U)
+    assert not r.empty
+    with pytest.raises(LLMError):
+        r.require_text()                                             # a tool call is not answer text; callers must handle it first
