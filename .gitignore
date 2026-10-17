@@ -20,3 +20,8 @@ secrets/
 credentials*.json
 *credential*.txt
 .keyring/
+
+# build artifacts
+*.egg-info/
+build/
+dist/
