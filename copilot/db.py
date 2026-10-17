@@ -13,6 +13,7 @@ from .config import Settings
 
 SOURCE_SCHEMA_VERSION = 2
 STATE_SCHEMA_VERSION = 1
+BUSY_TIMEOUT_S = 5        # how long to wait for another process's lock before failing
 
 SOURCE_DDL = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
@@ -141,33 +142,56 @@ def _apply(conn: sqlite3.Connection, ddl: str, version: int) -> None:
         conn.commit()
 
 
-def connect(path: Path, ddl: str, version: int) -> sqlite3.Connection:
+def connect(path: Path, ddl: str, version: int, apply: bool = True) -> sqlite3.Connection:
     Path(path).parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), check_same_thread=False)
+    conn = sqlite3.connect(str(path), check_same_thread=False, timeout=BUSY_TIMEOUT_S)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
-    _apply(conn, ddl, version)
+    if apply:
+        _apply(conn, ddl, version)
     return conn
 
 
+def _reset_derived(conn: sqlite3.Connection) -> None:
+    """Drop every table, view and trigger so the DDL can be re-applied. Used only for the derived source database."""
+    conn.execute("PRAGMA foreign_keys=OFF")
+    try:
+        for kind in ("view", "trigger"):
+            for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type=?", (kind,)).fetchall():
+                conn.execute(f'DROP {kind.upper()} IF EXISTS "{name}"')
+        virtual = [n for (n,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND sql LIKE 'CREATE VIRTUAL%'").fetchall()]
+        for name in virtual:                                     # dropping a virtual table also removes its shadow tables
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        for (name,) in conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'").fetchall():
+            conn.execute(f'DROP TABLE IF EXISTS "{name}"')
+        conn.execute("PRAGMA user_version = 0")
+        conn.commit()
+    finally:
+        conn.execute("PRAGMA foreign_keys=ON")
+
+
 def open_source(settings: Settings) -> sqlite3.Connection:
-    """The source database is derived from the dataset, so an older schema is discarded and rebuilt (never half-migrated).
-    User state lives in state.db and is untouched."""
+    """The source database is derived from the dataset, so an older schema is rebuilt (never half-migrated).
+
+    The rebuild happens inside the database, never by deleting the file: on Windows a file that another process (a running server
+    or evaluation) has open cannot be deleted, and deleting under a live reader is unsafe anyway. If another process holds a lock
+    the rebuild waits briefly, then fails with a clear message and leaves the database as it was. User state lives in state.db and is untouched."""
     path = Path(settings.source_db)
-    if path.exists():
-        try:
-            probe = sqlite3.connect(str(path))
-            version = probe.execute("PRAGMA user_version").fetchone()[0]
-            probe.close()
-        except sqlite3.DatabaseError:
-            version = None
-        if version is not None and 0 < version < SOURCE_SCHEMA_VERSION:
-            for suffix in ("", "-wal", "-shm"):
-                p = path.with_name(path.name + suffix)
-                if p.exists():
-                    p.unlink()
-    return connect(settings.source_db, SOURCE_DDL, SOURCE_SCHEMA_VERSION)
+    conn = connect(path, "", 0, apply=False)
+    try:
+        version = conn.execute("PRAGMA user_version").fetchone()[0]
+        if 0 < version < SOURCE_SCHEMA_VERSION:
+            try:
+                _reset_derived(conn)
+            except sqlite3.OperationalError as e:
+                raise RuntimeError(f"{path.name} has an older schema (v{version}) and must be rebuilt, but it is in use by another process "
+                                   f"({e}). Stop the other server or evaluation, or set COPILOT_DATA_DIR to a fresh folder.") from None
+        _apply(conn, SOURCE_DDL, SOURCE_SCHEMA_VERSION)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
 
 
 def open_state(settings: Settings) -> sqlite3.Connection:
