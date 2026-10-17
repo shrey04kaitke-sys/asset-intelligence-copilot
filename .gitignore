@@ -7,3 +7,16 @@ __pycache__/
 *.pyc
 .pytest_cache/
 node_modules/
+
+# Credentials and local secret material: never commit.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+secrets/
+credentials*.json
+*credential*.txt
+.keyring/

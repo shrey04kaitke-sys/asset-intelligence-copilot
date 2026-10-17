@@ -70,7 +70,8 @@ def test_missing_key_is_unconfigured_and_helpful(monkeypatch):
         monkeypatch.delenv(n, raising=False)
     with pytest.raises(LLMError) as ei:
         GemmaApiProvider(Settings())
-    assert ei.value.kind == "unconfigured" and ".env" in ei.value.message and "GEMINI_API_KEY" in ei.value.message and ei.value.message == KEY_HELP
+    assert ei.value.kind == "unconfigured" and "setup_gemini_key.py" in ei.value.message and "Credential Manager" in ei.value.message and "GEMINI_API_KEY" in ei.value.message
+    assert ei.value.message == KEY_HELP and "chat" in KEY_HELP
     assert not ei.value.retryable
 
 

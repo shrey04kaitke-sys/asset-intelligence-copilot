@@ -69,9 +69,35 @@ class Settings:
         return Path(self.data_dir) / "state.db"
 
     def api_key(self) -> str | None:
-        """Read at call time so the key is never stored on a long-lived object."""
+        """The model API key, read at call time and never cached on this object.
+
+        Order: an environment variable (kept for compatibility; its value is never displayed), then the
+        operating system's credential store. Raises CredentialStoreError if that store is unavailable.
+        """
+        v = self._env_key()
+        if v:
+            return v
+        from . import credentials
+        return credentials.get_api_key()
+
+    def api_key_source(self) -> str | None:
+        """Where a key would come from, without revealing it (None if there is no key)."""
+        name = self._env_key_name()
+        if name:
+            return f"environment variable {name}"
+        from . import credentials
+        if not credentials.get_api_key():
+            return None
+        return "Windows Credential Manager" if credentials.backend_name().endswith("WinVaultKeyring") else "operating-system credential store"
+
+    @staticmethod
+    def _env_key_name() -> str | None:
         for name in ("GEMINI_API_KEY", "GOOGLE_API_KEY"):
-            v = (os.environ.get(name) or "").strip().strip("\"'").strip()
-            if v:
-                return v
+            if (os.environ.get(name) or "").strip().strip("\"'").strip():
+                return name
         return None
+
+    @classmethod
+    def _env_key(cls) -> str | None:
+        name = cls._env_key_name()
+        return (os.environ[name]).strip().strip("\"'").strip() if name else None

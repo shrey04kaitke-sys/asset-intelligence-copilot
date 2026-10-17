@@ -14,11 +14,13 @@ from typing import Any, Literal
 
 from .base import RETRYABLE, LLMError, LLMResponse, ToolCall, Turn, Usage, scrub
 from ..config import Settings
+from ..credentials import CredentialStoreError
 
 log = logging.getLogger("copilot.llm.gemma")
 
-KEY_HELP = ("GEMINI_API_KEY is not set for this process. Put your existing Google AI Studio key in a git-ignored .env file at the project root "
-            "(line: GEMINI_API_KEY=<your key>, saved as UTF-8) or set it in the shell that starts the app. Never paste it into chat or commit it.")
+KEY_HELP = ("No Gemini API key is available. Run `python scripts/setup_gemini_key.py` in your own terminal (hidden prompt; the key is stored in the "
+            "Windows Credential Manager), or set GEMINI_API_KEY in the environment of the process that starts the app. "
+            "Never paste the key into chat or commit it.")
 
 # JSON-schema keys the Gemini API's Schema type understands (everything else is dropped before sending).
 _SCHEMA_KEYS = {"type", "description", "enum", "format", "items", "properties", "required", "nullable", "anyOf", "minimum", "maximum", "minItems", "maxItems",
@@ -77,13 +79,22 @@ class GemmaApiProvider:
         self.max_retries = max(0, max_retries)
         self._sleep = sleep
         if client is None:
-            key = self.settings.api_key()
+            try:
+                key = self.settings.api_key()
+            except CredentialStoreError as e:
+                raise LLMError("unconfigured", f"{e.message}. {KEY_HELP}", provider=self.name, model=self.model) from None
             if not key:
                 raise LLMError("unconfigured", KEY_HELP, provider=self.name, model=self.model)
             from google import genai
             from google.genai import types
             client = genai.Client(api_key=key, http_options=types.HttpOptions(timeout=int(self.timeout_s * 1000)))
         self._client = client
+
+    def _key_for_scrubbing(self) -> str:
+        try:
+            return self.settings.api_key() or ""
+        except CredentialStoreError:
+            return ""
 
     def __repr__(self) -> str:
         return f"GemmaApiProvider(model={self.model!r})"
@@ -193,7 +204,7 @@ class GemmaApiProvider:
         if api_err:
             code = getattr(e, "code", None)
             status = getattr(e, "status", None) or ""
-            msg = scrub(getattr(e, "message", "") or "", [self.settings.api_key() or ""], 300)
+            msg = scrub(getattr(e, "message", "") or "", [self._key_for_scrubbing()], 300)
             low = msg.lower()
             detail = f"HTTP {code} {status}: {msg}".strip()
             if code in (401, 403) or "api key not valid" in low or "api_key_invalid" in low:
