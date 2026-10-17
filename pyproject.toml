@@ -14,11 +14,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "playwright>=1.45"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-markers = ["live: needs a live model provider (skipped unless configured)", "realstore: touches the real OS credential store with synthetic values"]
+markers = ["live: needs a live model provider (skipped unless configured)", "realstore: touches the real OS credential store with synthetic values", "e2e: drives the real UI in a real browser (scripted model)"]
 
 [tool.setuptools.packages.find]
 include = ["copilot*"]

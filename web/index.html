@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Asset Intelligence Workspace</title>
+  <meta name="description" content="Evidence-grounded decision support for oil-well asset data">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="topbar" role="banner">
+    <div class="brand">
+      <span class="brand-mark" aria-hidden="true">◈</span>
+      <div>
+        <h1 class="brand-name">Asset Intelligence Workspace</h1>
+        <p class="brand-sub" id="data-banner">Loading data status…</p>
+      </div>
+    </div>
+    <nav class="tabs" aria-label="Primary" id="nav">
+      <a href="#/overview" data-route="overview">Fleet overview</a>
+      <a href="#/assets" data-route="assets">Assets</a>
+      <a href="#/investigate" data-route="investigate">Investigate</a>
+      <a href="#/knowledge" data-route="knowledge">Evidence &amp; knowledge</a>
+    </nav>
+    <div class="who">
+      <label for="user-picker" class="who-label">Signed in as</label>
+      <select id="user-picker" aria-describedby="user-help"></select>
+      <span id="user-help" class="sr-only">Chooses which user's private memory and permissions apply. This is a picker, not authentication.</span>
+    </div>
+  </header>
+
+  <main id="main" tabindex="-1"></main>
+
+  <aside id="drawer" class="drawer" role="complementary" aria-label="Evidence details" aria-hidden="true" hidden>
+    <div class="drawer-head">
+      <button type="button" class="btn btn-quiet" id="drawer-back" aria-label="Back to previous evidence" hidden>← Back</button>
+      <h2 id="drawer-title" tabindex="-1">Evidence</h2>
+      <button type="button" class="btn btn-quiet" id="drawer-close" aria-label="Close evidence panel">✕ Close</button>
+    </div>
+    <div id="drawer-body" class="drawer-body"></div>
+  </aside>
+  <div id="scrim" class="scrim" hidden></div>
+
+  <dialog id="modal" class="modal" aria-labelledby="modal-title"></dialog>
+
+  <div id="live" class="sr-only" role="status" aria-live="polite"></div>
+  <div id="toasts" class="toasts" aria-live="polite"></div>
+
+  <noscript><p class="noscript">This workspace needs JavaScript. The API is documented at <a href="/docs">/docs</a>.</p></noscript>
+  <script type="module" src="/static/js/main.js"></script>
+</body>
+</html>
